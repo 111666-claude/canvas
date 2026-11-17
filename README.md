@@ -85,6 +85,7 @@ High-quality (comparable to TeX) text rendering and line breaking. It uses HarfB
 - Handle any script, eg. latin, cyrillic, devanagari, arabic, hebrew, han, etc.
 - Handle left-to-right, right-to-left, or top-to-bottom/bottom-to-top writing systems.
 - Mix scripts and fonts in a single line, eg. combine latin and arabic, or bold and regular styles.
+- Set text along a path (`Context.DrawPathText` / `TextOnPath`), positioning glyphs by their advance along the path's arc length and rotating each glyph to the local tangent, with start distance, centering and letter spacing options.
 
 Additionally, many font formats are supported (such as TTF, OTF, WOFF, WOFF2, EOT) and rendering can apply a gamma correction of 1.43 for better results. See [Fonts & Text](https://github.com/tdewolff/canvas/wiki/Fonts-&-Text) for more information.
 
