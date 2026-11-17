@@ -13,6 +13,10 @@ import (
 type Options struct {
 	Compress    bool
 	SubsetFonts bool
+	// OutlineText converts text objects to glyph outline paths instead of
+	// embedding/referencing font files. The resulting PDF is independent of
+	// the runtime fonts while preserving the text layout.
+	OutlineText bool
 	cimage.ImageEncoding
 }
 
@@ -227,6 +231,11 @@ func (r *PDF) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix)
 
 // RenderText renders a text object to the canvas using a transformation matrix.
 func (r *PDF) RenderText(text *canvas.Text, m canvas.Matrix) {
+	if r.opts.OutlineText {
+		_ = text.RenderPathsTo(r, m, 0.0)
+		return
+	}
+
 	text.RenderDecorationsTo(r, m, 0.0)
 
 	text.WalkSpans(func(x, y float64, span canvas.TextSpan) {

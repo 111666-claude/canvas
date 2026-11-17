@@ -25,6 +25,12 @@ type Options struct {
 	Compression int
 	EmbedFonts  bool
 	SubsetFonts bool
+	// OutlineText converts text objects to glyph outline paths instead of
+	// emitting <text>/<tspan> elements. The resulting SVG is independent of
+	// the runtime fonts: no font files are embedded or referenced and the
+	// text layout (advances, baselines, line breaks, span fills) is
+	// preserved. Glyphs of fonts without TrueType/CFF outlines are skipped.
+	OutlineText bool
 	SizeUnits   string
 	cimage.ImageEncoding
 }
@@ -387,6 +393,14 @@ func (r *SVG) writeFontStyle(face, faceMain *canvas.FontFace, rtl bool, fill str
 // RenderText renders a text object to the canvas using a transformation matrix.
 func (r *SVG) RenderText(text *canvas.Text, m canvas.Matrix) {
 	if text.Empty() {
+		return
+	}
+
+	if r.opts.OutlineText {
+		// emit glyph outlines as <path> elements so the SVG does not depend
+		// on the runtime fonts; errors only cover unsupported outline fonts
+		// and are not recoverable in the serialized output
+		_ = text.RenderPathsTo(r, m, 0.0)
 		return
 	}
 
