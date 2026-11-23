@@ -65,8 +65,26 @@ type svgParser struct {
 	defs     map[string]svgDef
 	fonts    map[string]*FontFamily
 
+	// clipDefs holds parsed <clipPath> elements keyed by their id
+	clipDefs map[string]*clipPathDef
+	// clipStack holds the active clip-path contexts for nested elements
+	clipStack []clipContext
+	// layerIndexStack holds the layer count at the start of each element on
+	// the element stack, captured before the element's content is drawn
+	layerIndexStack []int
+
 	// active definitions for attributes
 	activeDefs map[string]svgDef
+}
+
+// clipContext records the clip-path applied by an element and the index of the
+// first canvas layer drawn inside it, so that clipping can be applied when the
+// element's end tag is reached.
+type clipContext struct {
+	stackDepth int // depth of svg.elemStack when the clip was activated
+	id         string
+	view       Matrix
+	startIndex int
 }
 
 func (svg *svgParser) parseViewBox(attrWidth, attrHeight, attrViewBox string) (float64, float64, [4]float64) {
@@ -118,6 +136,7 @@ func (svg *svgParser) push(tag string, attrs map[string]string) {
 	svg.ctx.Push()
 	svg.stateStack = append(svg.stateStack, svg.state)
 	svg.elemStack = append(svg.elemStack, svgElem{tag, attrs["id"], attrs})
+	svg.layerIndexStack = append(svg.layerIndexStack, len(svg.c.layers[svg.c.zindex]))
 }
 
 func (svg *svgParser) pop() {
@@ -128,6 +147,7 @@ func (svg *svgParser) pop() {
 	svg.elemStack = svg.elemStack[:len(svg.elemStack)-1]
 	svg.state = svg.stateStack[len(svg.stateStack)-1]
 	svg.stateStack = svg.stateStack[:len(svg.stateStack)-1]
+	svg.layerIndexStack = svg.layerIndexStack[:len(svg.layerIndexStack)-1]
 	svg.ctx.Pop()
 }
 
@@ -447,6 +467,44 @@ func (svg *svgParser) parseTag(l *xml.Lexer) *svgTag {
 	return root
 }
 
+// parseSubtree parses the children of an element whose start tag has already
+// been consumed, appending them to tag.content until the element's own end
+// tag is reached.
+func (svg *svgParser) parseSubtree(l *xml.Lexer, tag *svgTag) {
+	parent := tag
+	for {
+		tt, data := l.Next()
+		if tt == xml.ErrorToken {
+			if l.Err() != io.EOF {
+				svg.err = l.Err()
+			} else {
+				svg.err = parse.NewErrorLexer(svg.z, "unexpected end-of-file")
+			}
+			return
+		} else if tt == xml.StartTagToken {
+			var attrNames []string
+			var attrs map[string]string
+			name := string(data[1:])
+			tt, attrNames, attrs = svg.parseAttributes(l)
+			child := &svgTag{
+				parent:    parent,
+				name:      name,
+				attrNames: attrNames,
+				attrs:     attrs,
+			}
+			parent.content = append(parent.content, child)
+			if tt != xml.StartTagCloseVoidToken {
+				parent = child
+			}
+		} else if tt == xml.EndTagToken {
+			if parent == tag {
+				return
+			}
+			parent = parent.parent
+		}
+	}
+}
+
 func (svg *svgParser) parseDefs(l *xml.Lexer) {
 	for {
 		tag := svg.parseTag(l)
@@ -458,6 +516,8 @@ func (svg *svgParser) parseDefs(l *xml.Lexer) {
 			continue
 		}
 		switch tag.name {
+		case "clipPath":
+			svg.clipDefs[id] = svg.parseClipPath(tag)
 		case "linearGradient":
 			if _, ok := tag.attrs["x2"]; !ok {
 				tag.attrs["x2"] = "100%"
@@ -1001,6 +1061,12 @@ func (svg *svgParser) setAttribute(key, val string) {
 		if miter, ok := svg.ctx.StrokeJoiner.(MiterJoiner); ok {
 			miter.Limit = svg.state.strokeMiterLimit
 		}
+	case "fill-rule", "clip-rule":
+		if val == "evenodd" {
+			svg.ctx.SetFillRule(EvenOdd)
+		} else {
+			svg.ctx.SetFillRule(NonZero)
+		}
 	case "transform":
 		m := svg.parseTransform(val)
 		svg.ctx.ComposeView(m)
@@ -1023,6 +1089,20 @@ func (svg *svgParser) setAttribute(key, val string) {
 	case "marker-end":
 		if id := svg.parseUrlID(val); id != "" {
 			svg.activeDefs["marker-end"] = svg.defs[id]
+		}
+	case "clip-path":
+		if id := svg.parseUrlID(val); id != "" {
+			svg.activeDefs["clip-path"] = func(attr string, c *Canvas) {
+				// full render matrix of this element: Cartesian coordinate
+				// system followed by the user-space view transform
+				targetM := svg.ctx.CoordSystemView().Mul(svg.ctx.View())
+				svg.clipStack = append(svg.clipStack, clipContext{
+					stackDepth: len(svg.elemStack),
+					id:         id,
+					view:       targetM,
+					startIndex: svg.layerIndexStack[len(svg.layerIndexStack)-1],
+				})
+			}
 		}
 	}
 }
@@ -1115,6 +1195,7 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 		z:          z,
 		defs:       map[string]svgDef{},
 		fonts:      map[string]*FontFamily{},
+		clipDefs:   map[string]*clipPathDef{},
 		activeDefs: map[string]svgDef{},
 	}
 	for {
@@ -1165,6 +1246,17 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 					svg.parseDefs(l)
 				}
 				break
+			} else if tag == "clipPath" {
+				// clipPath may appear outside defs; parse the subtree as a
+				// definition and never render its children
+				clipTag := &svgTag{name: tag, attrNames: attrNames, attrs: attrs}
+				if tt != xml.StartTagCloseVoidToken {
+					svg.parseSubtree(l, clipTag)
+				}
+				if id := clipTag.attrs["id"]; id != "" {
+					svg.clipDefs[id] = svg.parseClipPath(clipTag)
+				}
+				break
 			}
 
 			// push new state
@@ -1191,6 +1283,14 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 
 			// tag is self-closing
 			if tt == xml.StartTagCloseVoidToken {
+				// a clip-path on a self-closing element has no EndTagToken,
+				// so apply it before popping the draw state
+				if n := len(svg.clipStack); n > 0 {
+					if clip := &svg.clipStack[n-1]; clip.stackDepth == len(svg.elemStack) {
+						svg.applyClip(clip.id, clip.view, svg.clipDefs, clip.startIndex)
+						svg.clipStack = svg.clipStack[:n-1]
+					}
+				}
 				svg.pop()
 			}
 		case xml.TextToken:
@@ -1209,6 +1309,15 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 				}
 			}
 		case xml.EndTagToken:
+			// apply the clip-path introduced by the element whose scope is
+			// closing, before its draw state is popped. Nested clips close in
+			// reverse order and each sees the geometry produced inside it.
+			if n := len(svg.clipStack); n > 0 {
+				if clip := &svg.clipStack[n-1]; clip.stackDepth == len(svg.elemStack) {
+					svg.applyClip(clip.id, clip.view, svg.clipDefs, clip.startIndex)
+					svg.clipStack = svg.clipStack[:n-1]
+				}
+			}
 			svg.pop()
 		}
 	}
