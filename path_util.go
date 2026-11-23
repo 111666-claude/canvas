@@ -775,10 +775,17 @@ func flattenCubicBezier(p0, p1, p2, p3 Point, tolerance float64) *Path {
 	return strokeCubicBezier(p0, p1, p2, p3, 0.0, tolerance)
 }
 
+// maxFlattenIterations bounds the number of subdivisions when flattening a single smooth Bézier section, so that pathological inputs (huge coordinates, near-zero tolerance) yield a bounded approximation instead of hanging.
+var maxFlattenIterations = 4096
+
 // split the curve and replace it by lines as long as (maximum deviation <= tolerance) is maintained
 func flattenSmoothCubicBezier(p *Path, p0, p1, p2, p3 Point, d, tolerance float64) {
 	t := 0.0
-	for t < 1.0 {
+	for n := 0; t < 1.0; n++ {
+		if maxFlattenIterations <= n {
+			// bounded approximation: emit the rest as a straight line
+			break
+		}
 		D := p1.Sub(p0)
 		if p0.Equals(p1) {
 			// p0 == p1, base on p2
@@ -805,7 +812,8 @@ func flattenSmoothCubicBezier(p *Path, p0, p1, p2, p3 Point, d, tolerance float6
 
 		// choose whichever is most curved, P2-P0 or P3-P0
 		t = math.Min(t2, t3)
-		if 1.0 <= t {
+		if !(0.0 < t) || 1.0 <= t {
+			// t is NaN or outside (0,1), stop subdividing
 			break
 		}
 		_, _, _, _, p0, p1, p2, p3 = cubicBezierSplit(p0, p1, p2, p3, t)

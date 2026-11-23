@@ -442,8 +442,8 @@ type pathStrokeState struct {
 	large, sweep                bool    // arcs
 }
 
-// offset returns the rhs and lhs paths from offsetting a path (must not have subpaths). It closes rhs and lhs when p is closed as well.
-func (p *Path) offset(halfWidth float64, cr Capper, jr Joiner, strokeOpen bool, tolerance float64) (*Path, *Path) {
+// strokeStates returns the states of all segments of a path (must not have subpaths) used for stroking and offsetting, and whether the path closes itself.
+func (p *Path) strokeStates(halfWidth float64) ([]pathStrokeState, bool) {
 	// only non-empty paths are evaluated
 	closed := false
 	states := []pathStrokeState{}
@@ -495,7 +495,21 @@ func (p *Path) offset(halfWidth float64, cr Capper, jr Joiner, strokeOpen bool, 
 			rx, ry, phi := p.d[i+1], p.d[i+2], p.d[i+3]
 			large, sweep := toArcFlags(p.d[i+4])
 			end = Point{p.d[i+5], p.d[i+6]}
-			_, _, theta0, theta1 := ellipseToCenter(start.X, start.Y, rx, ry, phi, large, sweep, end.X, end.Y)
+			cx, cy, theta0, theta1 := ellipseToCenter(start.X, start.Y, rx, ry, phi, large, sweep, end.X, end.Y)
+			if math.IsNaN(cx) || math.IsNaN(cy) || math.IsInf(cx, 0.0) || math.IsInf(cy, 0.0) {
+				// degenerate arc (e.g. astronomical radii), approximate by a straight line
+				n := end.Sub(start).Rot90CW().Norm(halfWidth)
+				states = append(states, pathStrokeState{
+					cmd: LineToCmd,
+					p0:  start,
+					p1:  end,
+					n0:  n,
+					n1:  n,
+					r0:  math.NaN(),
+					r1:  math.NaN(),
+				})
+				break
+			}
 			n0 := ellipseNormal(rx, ry, phi, sweep, theta0, halfWidth)
 			n1 := ellipseNormal(rx, ry, phi, sweep, theta1, halfWidth)
 			r0 := ellipseCurvatureRadius(rx, ry, sweep, theta0)
@@ -535,6 +549,12 @@ func (p *Path) offset(halfWidth float64, cr Capper, jr Joiner, strokeOpen bool, 
 		start = end
 		i += cmdLen(cmd)
 	}
+	return states, closed
+}
+
+// offset returns the rhs and lhs paths from offsetting a path (must not have subpaths). It closes rhs and lhs when p is closed as well.
+func (p *Path) offset(halfWidth float64, cr Capper, jr Joiner, strokeOpen bool, tolerance float64) (*Path, *Path) {
+	states, closed := p.strokeStates(halfWidth)
 	if len(states) == 0 {
 		return nil, nil
 	}
@@ -630,10 +650,10 @@ func (p *Path) offset(halfWidth float64, cr Capper, jr Joiner, strokeOpen bool, 
 	return rhs, lhs
 }
 
-// Offset offsets the path by w and returns a new path. A positive w will offset the path to the right-hand side, that is, it expands CCW oriented contours and contracts CW oriented contours. If you don't know the orientation you can use `Path.CCW` to find out, but if there may be self-intersection you should use `Path.Settle` to remove them and orient all filling contours CCW. The tolerance is the maximum deviation from the actual offset when flattening Béziers and optimizing the path.
+// Offset offsets the path by w and returns a new path. A positive w will offset the path to the right-hand side, that is, it expands CCW oriented contours and contracts CW oriented contours. If you don't know the orientation you can use `Path.CCW` to find out, but if there may be self-intersection you should use `Path.Settle` to remove them and orient all filling contours CCW. The tolerance is the maximum deviation from the actual offset when flattening Béziers and optimizing the path. See Path.OffsetWithOptions for configurable caps, joins and miter limits, and for offsetting open paths into fillable boundaries.
 func (p *Path) Offset(w float64, tolerance float64) *Path {
 	if Equal(w, 0.0) {
-		return p
+		return p.Copy()
 	}
 
 	q := &Path{}
