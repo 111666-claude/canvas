@@ -43,6 +43,7 @@ type SVG struct {
 	fonts         map[*canvas.Font]bool
 	fontSubset    map[*canvas.Font]*canvas.FontSubsetter
 	maskID        int
+	clipID        int
 	defs          map[any][2]string
 	classes       []string
 	customStyle   string
@@ -174,6 +175,32 @@ func (r *SVG) Size() (float64, float64) {
 
 // RenderPath renders a path to the canvas using a style and a transformation matrix.
 func (r *SVG) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix) {
+	// SVG has no native conic gradient; emit tessellated solid-colored wedges
+	// clipped to the (possibly stroked) path instead. The conic gradient is
+	// sampled in canvas coordinates, so wedges are transformed with the
+	// path's matrix.
+	if style.HasFill() && style.Fill.IsGradient() {
+		if conic, ok := style.Fill.Gradient.(*canvas.ConicGradient); ok {
+			clip := path.Copy().Transform(canvas.Identity.ReflectYAbout(r.height / 2.0).Mul(m))
+			r.renderConic(conic, m, clip, "")
+			style.Fill = canvas.Paint{} // already painted
+		}
+	}
+	if style.HasStroke() && style.Stroke.IsGradient() {
+		if conic, ok := style.Stroke.Gradient.(*canvas.ConicGradient); ok {
+			tolerance := canvas.PixelTolerance
+			strokePath := path
+			if 0 < len(style.Dashes) {
+				dashOffset, dashes := canvas.ScaleDash(style.StrokeWidth, style.DashOffset, style.Dashes)
+				strokePath = strokePath.Dash(dashOffset, dashes...)
+			}
+			strokePath = strokePath.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, tolerance)
+			clip := strokePath.Transform(canvas.Identity.ReflectYAbout(r.height / 2.0).Mul(m))
+			r.renderConic(conic, m, clip, "")
+			style.Stroke = canvas.Paint{} // already painted
+		}
+	}
+
 	fillPaint := r.writePaint(style.Fill, m)
 	strokePaint := r.writePaint(style.Stroke, m)
 
@@ -552,6 +579,66 @@ func splitImageAlphaChannel(img image.Image) (image.Image, image.Image) {
 	}
 
 	return opaque, mask
+}
+
+// renderConic emits a conic gradient as tessellated solid-colored wedges
+// clipped by the clip path. The clip path is in the SVG's (Y-flipped) output
+// coordinate system. The wedges are sampled in canvas coordinates (so the
+// colors match the rasterizer) and transformed by the same matrix as the
+// painted path. classes is appended to the group when non-empty.
+func (r *SVG) renderConic(conic *canvas.ConicGradient, m canvas.Matrix, clip *canvas.Path, classes string) {
+	if clip.Empty() || len(conic.Grad) == 0 {
+		return
+	}
+
+	flip := canvas.Identity.ReflectYAbout(r.height / 2.0)
+	full := flip.Mul(m) // canvas -> SVG output coordinates
+
+	// Radius (in canvas units) large enough that, after transformation, the
+	// wedges cover every corner of the clip's bounding box.
+	clipBounds := clip.FastBounds()
+	centerSVG := full.Dot(conic.Center)
+	corners := [4]canvas.Point{
+		{clipBounds.X0, clipBounds.Y0}, {clipBounds.X1, clipBounds.Y0},
+		{clipBounds.X1, clipBounds.Y1}, {clipBounds.X0, clipBounds.Y1},
+	}
+	svgRadius := 0.0
+	for _, corner := range corners {
+		svgRadius = math.Max(svgRadius, math.Hypot(corner.X-centerSVG.X, corner.Y-centerSVG.Y))
+	}
+	// convert the SVG-space radius back into canvas-space length using the
+	// inverse transformation's unit scaling
+	inv := full.Inv()
+	unit := inv.Dot(centerSVG.Add(canvas.Point{1.0, 0.0})).Sub(conic.Center)
+	scale := math.Hypot(unit.X, unit.Y)
+	if !(scale > 0.0) || math.IsInf(scale, 0) || !(svgRadius > 0.0) || math.IsInf(svgRadius, 0) {
+		return
+	}
+	radius := svgRadius * scale
+
+	ref := fmt.Sprintf("c%v", r.clipID)
+	r.clipID++
+
+	// wedges are constructed in canvas coordinates and transformed like the
+	// painted path
+	wedgePaths, wedgeColors := conic.Wedges(radius, 0.0, 2.0*math.Pi)
+	if len(wedgePaths) == 0 {
+		return
+	}
+
+	fmt.Fprintf(r.w, `<clipPath id="%v"><path d="%s"/></clipPath>`, ref, clip.ToSVG())
+	fmt.Fprintf(r.w, `<g clip-path="url(#%v)"`, ref)
+	if classes != "" {
+		fmt.Fprintf(r.w, ` class="%s"`, classes)
+	}
+	fmt.Fprintf(r.w, `>`)
+	for i, wedge := range wedgePaths {
+		// wedges are constructed in canvas coordinates and transformed with
+		// the same matrix as the painted path, then flipped into SVG coords
+		w := wedge.Copy().Transform(full)
+		fmt.Fprintf(r.w, `<path d="%s" fill="%v"/>`, w.ToSVG(), canvas.CSSColor(wedgeColors[i]))
+	}
+	fmt.Fprintf(r.w, `</g>`)
 }
 
 func (r *SVG) writePaint(paint canvas.Paint, m canvas.Matrix) string {

@@ -141,6 +141,13 @@ func (g Grad) ToRadial(c0 Point, r0 float64, c1 Point, r1 float64) *RadialGradie
 	return grad
 }
 
+func (g Grad) ToConic(center Point, start, arc float64, spread Spread) *ConicGradient {
+	grad := NewConicGradient(center, start, arc)
+	grad.Spread = spread
+	grad.Grad = g
+	return grad
+}
+
 func (g Grad) SetColorSpace(colorSpace ColorSpace) {
 	if _, ok := colorSpace.(LinearColorSpace); ok {
 		return
