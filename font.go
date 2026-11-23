@@ -8,6 +8,8 @@ import (
 	"os"
 	"reflect"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/tdewolff/canvas/text"
 	"github.com/tdewolff/font"
@@ -233,6 +235,14 @@ type Font struct {
 	shaper     text.Shaper
 	variations string
 	features   string
+	mu         sync.Mutex // guards the shaper, which is not safe for concurrent use
+}
+
+// shape shapes a string with the font's shaper. It is safe for concurrent use.
+func (f *Font) shape(s string, ppem uint16, direction text.Direction, script text.Script, lang, features, variations string) []text.Glyph {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.shaper.Shape(s, ppem, direction, script, lang, features, variations)
 }
 
 // LoadLocalFont loads a font from the system's fonts.
@@ -355,10 +365,15 @@ func (f *Font) Face(size float64, ifill any, deco ...FontDecorator) *FontFace {
 
 ////////////////////////////////////////////////////////////////
 
+// MaxFallbackChainLength is the maximum number of fallback fonts that will be used for a font face. Longer chains are truncated to avoid excessive shaping times.
+const MaxFallbackChainLength = 32
+
 // FontFamily contains a family of fonts (bold, italic, ...). Allowing to select an italic style as the native italic font or to use faux italic if not present.
 type FontFamily struct {
-	name  string
-	fonts map[FontStyle]*Font
+	name      string
+	mu        sync.RWMutex
+	fonts     map[FontStyle]*Font
+	fallbacks []*FontFamily
 }
 
 // NewFontFamily returns a new font family.
@@ -369,11 +384,137 @@ func NewFontFamily(name string) *FontFamily {
 	}
 }
 
-// Destroy should be called when using HarfBuzz to free the C resources.
+// Destroy should be called when using HarfBuzz to free the C resources. Fallback font families are not destroyed, they are owned by the caller.
 func (family *FontFamily) Destroy() {
+	family.mu.RLock()
+	defer family.mu.RUnlock()
 	for _, font := range family.fonts {
 		font.Destroy()
 	}
+}
+
+// SetFallbacks sets the fallback font families that are used when a glyph is missing from this family's font, in decreasing priority. The given slice is copied and will not be modified. Nil families and cycles in the chain are safely ignored when resolving fonts, see also ValidateFallbacks.
+func (family *FontFamily) SetFallbacks(fallbacks ...*FontFamily) {
+	family.mu.Lock()
+	family.fallbacks = append([]*FontFamily(nil), fallbacks...)
+	family.mu.Unlock()
+}
+
+// AddFallback appends fallback font families to the fallback chain, see SetFallbacks.
+func (family *FontFamily) AddFallback(fallbacks ...*FontFamily) {
+	family.mu.Lock()
+	family.fallbacks = append(family.fallbacks, fallbacks...)
+	family.mu.Unlock()
+}
+
+// Fallbacks returns a copy of the fallback chain as set by SetFallbacks or AddFallback.
+func (family *FontFamily) Fallbacks() []*FontFamily {
+	family.mu.RLock()
+	defer family.mu.RUnlock()
+	return append([]*FontFamily(nil), family.fallbacks...)
+}
+
+// ValidateFallbacks returns an error if the fallback chain contains nil or empty font families, a cycle, or exceeds MaxFallbackChainLength. Note that an invalid chain is still safe to use: offending families are skipped when resolving fallback fonts.
+func (family *FontFamily) ValidateFallbacks() error {
+	seen := map[*FontFamily]bool{family: true}
+	stack := map[*FontFamily]bool{}
+	var walk func(f *FontFamily) error
+	walk = func(f *FontFamily) error {
+		stack[f] = true
+		defer delete(stack, f)
+		f.mu.RLock()
+		fallbacks := append([]*FontFamily(nil), f.fallbacks...)
+		numFonts := len(f.fonts)
+		f.mu.RUnlock()
+		if f != family && numFonts == 0 {
+			return fmt.Errorf("font family '%s' in fallback chain of font family '%s' has no fonts loaded", f.name, family.name)
+		}
+		for _, next := range fallbacks {
+			if next == nil {
+				return fmt.Errorf("fallback chain of font family '%s' contains a nil font family", family.name)
+			}
+			if stack[next] {
+				return fmt.Errorf("fallback chain of font family '%s' contains a cycle involving font family '%s'", family.name, next.name)
+			}
+			if !seen[next] {
+				seen[next] = true
+				if MaxFallbackChainLength < len(seen)-1 {
+					return fmt.Errorf("fallback chain of font family '%s' exceeds the maximum length of %d", family.name, MaxFallbackChainLength)
+				}
+			}
+			if err := walk(next); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return walk(family)
+}
+
+// fallbackChain returns the flattened list of fallback font families in decreasing priority. Nil families and families already seen (cycles) are skipped, and the list is truncated at MaxFallbackChainLength entries.
+func (family *FontFamily) fallbackChain() []*FontFamily {
+	chain := []*FontFamily{}
+	visited := map[*FontFamily]bool{family: true}
+	queue := []*FontFamily{family}
+	for 0 < len(queue) && len(chain) < MaxFallbackChainLength {
+		f := queue[0]
+		queue = queue[1:]
+		f.mu.RLock()
+		fallbacks := append([]*FontFamily(nil), f.fallbacks...)
+		f.mu.RUnlock()
+		for _, next := range fallbacks {
+			if next == nil || visited[next] {
+				continue
+			}
+			visited[next] = true
+			chain = append(chain, next)
+			if MaxFallbackChainLength <= len(chain) {
+				break
+			}
+			queue = append(queue, next)
+		}
+	}
+	return chain
+}
+
+// matchStyle returns the font that matches the requested style closest, together with the style it actually has. It returns nil for an empty family.
+func (family *FontFamily) matchStyle(style FontStyle) (*Font, FontStyle) {
+	family.mu.RLock()
+	defer family.mu.RUnlock()
+	if font := family.fonts[style]; font != nil {
+		return font, style
+	}
+	minDiff := math.Inf(1.0)
+	minStyle := FontRegular
+	for s := range family.fonts {
+		diff := math.Abs(style.FauxWeight() - s.FauxWeight())
+		if style.Italic() != s.Italic() {
+			diff += 0.02
+		}
+		if diff < minDiff {
+			minStyle = s
+			minDiff = diff
+		}
+	}
+	return family.fonts[minStyle], minStyle
+}
+
+// resolveFallbacks returns the fonts of the fallback chain that best match the requested style. Families without fonts are skipped.
+func (family *FontFamily) resolveFallbacks(style FontStyle) []*Font {
+	chain := family.fallbackChain()
+	if len(chain) == 0 {
+		return nil
+	}
+	fonts := make([]*Font, 0, len(chain))
+	for _, f := range chain {
+		if font, _ := f.matchStyle(style); font != nil {
+			fonts = append(fonts, font)
+		}
+	}
+	if len(fonts) == 0 {
+		return nil
+	}
+	return fonts
 }
 
 // Name returns the name of the font family.
@@ -383,6 +524,8 @@ func (family *FontFamily) Name() string {
 
 // SetVariations sets the font variations (not yet supported).
 func (family *FontFamily) SetVariations(variations string) {
+	family.mu.RLock()
+	defer family.mu.RUnlock()
 	for _, font := range family.fonts {
 		font.SetVariations(variations)
 	}
@@ -390,6 +533,8 @@ func (family *FontFamily) SetVariations(variations string) {
 
 // SetFeatures sets the font features (not yet supported).
 func (family *FontFamily) SetFeatures(features string) {
+	family.mu.RLock()
+	defer family.mu.RUnlock()
 	for _, font := range family.fonts {
 		font.SetFeatures(features)
 	}
@@ -413,8 +558,10 @@ func (family *FontFamily) LoadSystemFont(name string, style FontStyle) error {
 	if err != nil {
 		return err
 	}
+	family.mu.Lock()
 	family.fonts[style] = font
 	font.name = family.name
+	family.mu.Unlock()
 	return nil
 }
 
@@ -431,8 +578,10 @@ func (family *FontFamily) LoadFontFile(filename string, style FontStyle) error {
 	if err != nil {
 		return err
 	}
+	family.mu.Lock()
 	family.fonts[style] = font
 	font.name = family.name
+	family.mu.Unlock()
 	return nil
 }
 
@@ -449,8 +598,10 @@ func (family *FontFamily) LoadFontCollection(filename string, index int, style F
 	if err != nil {
 		return err
 	}
+	family.mu.Lock()
 	family.fonts[style] = font
 	font.name = family.name
+	family.mu.Unlock()
 	return nil
 }
 
@@ -467,8 +618,10 @@ func (family *FontFamily) LoadFont(b []byte, index int, style FontStyle) error {
 	if err != nil {
 		return err
 	}
+	family.mu.Lock()
 	family.fonts[style] = font
 	font.name = family.name
+	family.mu.Unlock()
 	return nil
 }
 
@@ -481,7 +634,10 @@ func (family *FontFamily) MustLoadFont(b []byte, index int, style FontStyle) {
 
 // Face gets the font face given by the font size in points. Other arguments that can be passed: Paint/Pattern/color.Color (=Black), FontStyle (=FontRegular), FontVariant (=FontNormal), multiple FontDecorator, and Hinting (=VerticalHinting).
 func (family *FontFamily) Face(size float64, args ...any) *FontFace {
-	if len(family.fonts) == 0 {
+	family.mu.RLock()
+	isEmpty := len(family.fonts) == 0
+	family.mu.RUnlock()
+	if isEmpty {
 		panic("font family is empty")
 	}
 
@@ -536,21 +692,9 @@ func (family *FontFamily) Face(size float64, args ...any) *FontFace {
 	}
 
 	// find closest font that matches requested style
-	face.Font = family.fonts[face.Style]
-	if face.Font == nil {
-		minDiff := math.Inf(1.0)
-		minStyle := FontRegular
-		for style := range family.fonts {
-			diff := math.Abs(face.Style.FauxWeight() - style.FauxWeight())
-			if face.Style.Italic() != style.Italic() {
-				diff += 0.02
-			}
-			if diff < minDiff {
-				minStyle = style
-				minDiff = diff
-			}
-		}
-		face.Font = family.fonts[minStyle]
+	font, minStyle := family.matchStyle(face.Style)
+	face.Font = font
+	if minStyle != face.Style {
 		face.FauxBold += face.Style.FauxWeight() - minStyle.FauxWeight()
 		if face.Style.Italic() != minStyle.Italic() {
 			sign := 1.0
@@ -564,6 +708,9 @@ func (family *FontFamily) Face(size float64, args ...any) *FontFace {
 			}
 		}
 	}
+
+	// resolve fallback fonts for glyphs missing from the primary font
+	face.Fallbacks = family.resolveFallbacks(face.Style)
 
 	if face.Variant == FontSubscript || face.Variant == FontSuperscript {
 		scale := 0.583
@@ -606,6 +753,9 @@ func (family *FontFamily) Face(size float64, args ...any) *FontFace {
 type FontFace struct {
 	Font *Font
 
+	// Fallbacks are the fonts used for glyphs that are missing from Font, in decreasing priority. It is nil when the font family has no fallback chain.
+	Fallbacks []*Font
+
 	Size    float64 // in mm
 	Style   FontStyle
 	Variant FontVariant
@@ -638,6 +788,22 @@ func (face *FontFace) Equals(other *FontFace) bool {
 // Name returns the name of the underlying font.
 func (face *FontFace) Name() string {
 	return face.Font.name
+}
+
+// FontFor returns the font (the primary font or one of the fallback fonts) that owns the given SFNT font, or nil if none does. A nil SFNT returns the primary font.
+func (face *FontFace) FontFor(sfnt *font.SFNT) *Font {
+	if face.Font == nil {
+		return nil
+	}
+	if sfnt == nil || sfnt == face.Font.SFNT {
+		return face.Font
+	}
+	for _, fallback := range face.Fallbacks {
+		if fallback.SFNT == sfnt {
+			return fallback
+		}
+	}
+	return nil
 }
 
 // HasDecoration returns true if the font face has decorations enabled.
@@ -698,7 +864,102 @@ func (face *FontFace) LineHeight() float64 {
 
 func (face *FontFace) Glyphs(s string) []text.Glyph {
 	ppem := face.PPEM(DefaultResolution)
-	return face.Font.shaper.Shape(s, ppem, face.Direction, face.Script, face.Language, face.Font.features, face.Font.variations)
+	return face.shape(s, ppem, face.Direction, face.Script)
+}
+
+// shape shapes a string with the face's font and applies the fallback chain for missing glyphs. Each glyph gets its SFNT and Size set so that glyphs from different fonts can be mixed in a single slice.
+func (face *FontFace) shape(s string, ppem uint16, direction text.Direction, script text.Script) []text.Glyph {
+	glyphs := face.Font.shape(s, ppem, direction, script, face.Language, face.Font.features, face.Font.variations)
+	if 0 < len(face.Fallbacks) {
+		glyphs = face.shapeFallback(s, glyphs, ppem, direction, script)
+	}
+	for i := range glyphs {
+		if glyphs[i].SFNT == nil {
+			glyphs[i].SFNT = face.Font.SFNT
+		}
+		if glyphs[i].Size == 0.0 {
+			glyphs[i].Size = face.Size
+		}
+	}
+	return glyphs
+}
+
+// isMissingGlyph returns true if the glyph is the .notdef glyph (GID 0) for a character that should have a glyph. Control and format characters (such as ZWJ) legitimately shape to invisible glyphs and are not considered missing.
+func isMissingGlyph(glyph text.Glyph) bool {
+	if glyph.ID != 0 || len(glyph.Text) == 0 {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(glyph.Text)
+	return !unicode.Is(unicode.Cc, r) && !unicode.Is(unicode.Cf, r) && !unicode.Is(unicode.Cs, r)
+}
+
+// shapeFallback replaces runs of missing glyphs (.notdef) by glyphs shaped with the fallback fonts, in decreasing priority. Consecutive missing glyphs are reshaped as a group so that clusters (such as emoji sequences) are shaped together and cluster indices are preserved. Glyphs that are missing from all fonts keep the primary font's .notdef glyph.
+func (face *FontFace) shapeFallback(s string, glyphs []text.Glyph, ppem uint16, direction text.Direction, script text.Script) []text.Glyph {
+	for _, fallback := range face.Fallbacks {
+		if fallback == nil || fallback.SFNT == nil {
+			continue
+		}
+		hasMissing := false
+		for i := range glyphs {
+			if isMissingGlyph(glyphs[i]) {
+				hasMissing = true
+				break
+			}
+		}
+		if !hasMissing {
+			break
+		}
+
+		out := make([]text.Glyph, 0, len(glyphs))
+		for i := 0; i < len(glyphs); {
+			if !isMissingGlyph(glyphs[i]) {
+				out = append(out, glyphs[i])
+				i++
+				continue
+			}
+
+			// group consecutive missing glyphs, their clusters span the substring to reshape
+			j := i + 1
+			for j < len(glyphs) && isMissingGlyph(glyphs[j]) {
+				j++
+			}
+			start, end := uint32(math.MaxUint32), uint32(0)
+			for k := i; k < j; k++ {
+				if glyphs[k].Cluster < start {
+					start = glyphs[k].Cluster
+				}
+				if clusterEnd := glyphs[k].Cluster + uint32(len(glyphs[k].Text)); end < clusterEnd {
+					end = clusterEnd
+				}
+			}
+			if uint32(len(s)) < end {
+				// should never happen, keep the original glyphs
+				out = append(out, glyphs[i:j]...)
+				i = j
+				continue
+			}
+
+			subGlyphs := fallback.shape(s[start:end], ppem, direction, script, face.Language, fallback.features, fallback.variations)
+			covered := false
+			for k := range subGlyphs {
+				subGlyphs[k].Cluster += start
+				subGlyphs[k].SFNT = fallback.SFNT
+				subGlyphs[k].Size = face.Size
+				if !isMissingGlyph(subGlyphs[k]) {
+					covered = true
+				}
+			}
+			if covered {
+				// glyphs that are still missing get another chance with the next fallback font
+				out = append(out, subGlyphs...)
+			} else {
+				out = append(out, glyphs[i:j]...)
+			}
+			i = j
+		}
+		glyphs = out
+	}
+	return glyphs
 }
 
 // TextWidth returns the width of a given string in millimeters.
@@ -708,14 +969,23 @@ func (face *FontFace) TextWidth(s string) float64 {
 
 func (face *FontFace) textWidth(glyphs []text.Glyph) float64 {
 	w := int32(0)
+	wmm := 0.0 // width in millimeters of glyphs from fallback fonts
 	for _, glyph := range glyphs {
+		if glyph.SFNT != nil && glyph.SFNT != face.Font.SFNT && glyph.Size != 0.0 {
+			advance := float64(glyph.XAdvance)
+			if glyph.Vertical {
+				advance = -float64(glyph.YAdvance)
+			}
+			wmm += advance * glyph.Size / float64(glyph.SFNT.Head.UnitsPerEm)
+			continue
+		}
 		if !glyph.Vertical {
 			w += glyph.XAdvance
 		} else {
 			w -= glyph.YAdvance
 		}
 	}
-	return face.MmPerEm * float64(w)
+	return face.MmPerEm*float64(w) + wmm
 }
 
 func (face *FontFace) heights(mode WritingMode) (float64, float64, float64, float64) {
@@ -739,13 +1009,29 @@ func (face *FontFace) ToPath(s string) (*Path, float64) {
 
 func (face *FontFace) toPath(glyphs []text.Glyph, ppem uint16) (*Path, float64) {
 	p := &Path{}
-	f := face.MmPerEm
-	x, y := face.XOffset, face.YOffset
+	x, y := face.XOffset, face.YOffset // in font units of the primary font
+	xmm, ymm := 0.0, 0.0               // in millimeters, for glyphs of fallback fonts
 	for _, glyph := range glyphs {
-		_ = face.Font.GlyphPath(p, glyph.ID, ppem, f*float64(x+glyph.XOffset), f*float64(y+glyph.YOffset), f, font.NoHinting)
-		x += glyph.XAdvance
-		y += glyph.YAdvance
+		sfnt, f, glyphPPEM := face.Font.SFNT, face.MmPerEm, ppem
+		if glyph.SFNT != nil && glyph.SFNT != face.Font.SFNT && glyph.Size != 0.0 {
+			sfnt = glyph.SFNT
+			f = glyph.Size / float64(sfnt.Head.UnitsPerEm)
+			if ppem != 0 && face.MmPerEm != 0.0 {
+				glyphPPEM = uint16(float64(ppem) * f * float64(face.Font.Head.UnitsPerEm) / face.MmPerEm / float64(sfnt.Head.UnitsPerEm))
+			}
+		}
+		gx := face.MmPerEm*float64(x) + xmm + f*float64(glyph.XOffset)
+		gy := face.MmPerEm*float64(y) + ymm + f*float64(glyph.YOffset)
+		_ = sfnt.GlyphPath(p, glyph.ID, glyphPPEM, gx, gy, f, font.NoHinting)
+		if sfnt == face.Font.SFNT {
+			x += glyph.XAdvance
+			y += glyph.YAdvance
+		} else {
+			xmm += f * float64(glyph.XAdvance)
+			ymm += f * float64(glyph.YAdvance)
+		}
 	}
+	width := face.MmPerEm*float64(x) + xmm
 
 	if face.FauxBold != 0.0 {
 		d := face.FauxBold * face.Size
@@ -763,7 +1049,7 @@ func (face *FontFace) toPath(glyphs []text.Glyph, ppem uint16) (*Path, float64) 
 	if face.FauxItalic != 0.0 {
 		p = p.Transform(Identity.Shear(face.FauxItalic, 0.0))
 	}
-	return p, face.MmPerEm * float64(x)
+	return p, width
 }
 
 // Decorate will return the decoration path over a given width in millimeters.

@@ -160,8 +160,12 @@ func (l line) Heights(mode WritingMode) (float64, float64, float64, float64) {
 		for _, span := range l.spans {
 			if span.IsText() {
 				for _, glyph := range span.Glyphs {
-					if glyph.Vertical {
-						width = math.Max(width, 1.2*span.Face.MmPerEm*float64(glyph.SFNT.GlyphAdvance(glyph.ID))) // TODO: what left/right padding should upright characters in a vertical layout have?
+					if glyph.Vertical && glyph.SFNT != nil {
+						mmPerEm := span.Face.MmPerEm
+						if glyph.SFNT != span.Face.Font.SFNT && glyph.Size != 0.0 {
+							mmPerEm = glyph.Size / float64(glyph.SFNT.Head.UnitsPerEm)
+						}
+						width = math.Max(width, 1.2*mmPerEm*float64(glyph.SFNT.GlyphAdvance(glyph.ID))) // TODO: what left/right padding should upright characters in a vertical layout have?
 					} else {
 						spanTop, spanAscent, spanDescent, spanBottom := span.Face.heights(mode)
 						top = math.Max(top, spanTop)
@@ -201,6 +205,28 @@ type TextSpan struct {
 // IsText returns true if the text span is text and not objects (such as images or paths).
 func (span *TextSpan) IsText() bool {
 	return len(span.Objects) == 0
+}
+
+// HasFallbackGlyphs returns true if the span contains glyphs from a fallback font instead of the face's primary font.
+func (span *TextSpan) HasFallbackGlyphs() bool {
+	if span.Face == nil || span.Face.Font == nil {
+		return false
+	}
+	for _, glyph := range span.Glyphs {
+		if glyph.SFNT != nil && glyph.SFNT != span.Face.Font.SFNT {
+			return true
+		}
+	}
+	return false
+}
+
+// ToPath converts the text span's glyphs to a path, using each glyph's own font (primary or fallback).
+func (span *TextSpan) ToPath(resolution Resolution) *Path {
+	if !span.IsText() || span.Face == nil {
+		return &Path{}
+	}
+	p, _ := span.Face.toPath(span.Glyphs, span.Face.PPEM(resolution))
+	return p
 }
 
 // TextSpanObject is an object that can be used within a text span. It is a wrapper around Canvas and can thus draw anything to be mixed with text, such as images (emoticons) or paths (symbols).
@@ -337,7 +363,12 @@ func NewTextLine(face *FontFace, s string, halign TextAlign) *Text {
 				line := line{y: y, spans: []TextSpan{}}
 				for _, item := range itemizeString(s[i:j]) {
 					direction, _ := scriptDirection(HorizontalTB, Natural, item.Script, item.Level, face.Direction)
-					glyphs := face.Font.shaper.Shape(item.Text, ppem, direction, face.Script, face.Language, face.Font.features, face.Font.variations)
+					glyphs := face.shape(item.Text, ppem, direction, face.Script)
+					for _, glyph := range glyphs {
+						if glyphFont := face.FontFor(glyph.SFNT); glyphFont != nil {
+							t.fonts[glyphFont] = true
+						}
+					}
 					width := face.textWidth(glyphs)
 					line.spans = append(line.spans, TextSpan{
 						X:         x,
@@ -688,11 +719,15 @@ func (rt *RichText) ToText(width, height float64, halign, valign TextAlign, opts
 	glyphs := make([]text.Glyph, 0, len(logRunes))
 	for _, run := range runs {
 		ppem := run.Face.PPEM(DefaultResolution)
-		glyphRun := run.Face.Font.shaper.Shape(run.Text, ppem, run.Direction, run.Script, run.Face.Language, run.Face.Font.features, run.Face.Font.variations)
+		glyphRun := run.Face.shape(run.Text, ppem, run.Direction, run.Script)
 		for i := range glyphRun {
 			glyph := &glyphRun[i]
-			glyph.SFNT = run.Face.Font.SFNT
-			glyph.Size = run.Face.Size
+			if glyph.SFNT == nil {
+				glyph.SFNT = run.Face.Font.SFNT
+			}
+			if glyph.Size == 0.0 {
+				glyph.Size = run.Face.Size
+			}
 			glyph.Script = run.Script
 			glyph.Cluster += clusterOffset
 			if obj, ok := rt.objects[glyph.Cluster]; ok {
@@ -910,7 +945,11 @@ func (rt *RichText) ToText(width, height float64, halign, valign TextAlign, opts
 							}
 						}
 						width = run.Face.textWidth(glyphs[a:b])
-						t.fonts[run.Face.Font] = true
+						for _, glyph := range glyphs[a:b] {
+							if glyphFont := run.Face.FontFor(glyph.SFNT); glyphFont != nil {
+								t.fonts[glyphFont] = true
+							}
+						}
 					}
 
 					ac, bc := glyphs[a].Cluster, glyphs[b].Cluster

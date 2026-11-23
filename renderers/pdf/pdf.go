@@ -236,7 +236,6 @@ func (r *PDF) RenderText(text *canvas.Text, m canvas.Matrix) {
 
 			r.w.StartTextObject()
 			r.w.SetFill(span.Face.Fill, m)
-			r.w.SetFont(span.Face.Font, span.Face.Size, span.Direction)
 			r.w.SetTextPosition(m.Translate(x, y).Shear(span.Face.FauxItalic, 0.0))
 
 			if 0.0 < span.Face.FauxBold {
@@ -246,7 +245,26 @@ func (r *PDF) RenderText(text *canvas.Text, m canvas.Matrix) {
 			} else {
 				r.w.SetTextRenderMode(0)
 			}
-			r.w.WriteText(text.WritingMode, span.Glyphs)
+			if span.HasFallbackGlyphs() {
+				// split the span's glyphs into runs per font so that each glyph is
+				// encoded with the font that actually provided it
+				for i := 0; i < len(span.Glyphs); {
+					glyphFont := span.Face.FontFor(span.Glyphs[i].SFNT)
+					if glyphFont == nil {
+						glyphFont = span.Face.Font
+					}
+					j := i + 1
+					for j < len(span.Glyphs) && span.Face.FontFor(span.Glyphs[j].SFNT) == glyphFont {
+						j++
+					}
+					r.w.SetFont(glyphFont, span.Face.Size, span.Direction)
+					r.w.WriteText(text.WritingMode, span.Glyphs[i:j])
+					i = j
+				}
+			} else {
+				r.w.SetFont(span.Face.Font, span.Face.Size, span.Direction)
+				r.w.WriteText(text.WritingMode, span.Glyphs)
+			}
 			r.w.EndTextObject()
 		} else {
 			for _, obj := range span.Objects {

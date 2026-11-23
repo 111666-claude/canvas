@@ -417,6 +417,14 @@ func (r *SVG) RenderText(text *canvas.Text, m canvas.Matrix) {
 
 	text.WalkSpans(func(x, y float64, span canvas.TextSpan) {
 		if span.IsText() {
+			if span.HasFallbackGlyphs() {
+				// spans with glyphs from fallback fonts are rendered as paths so that
+				// glyph positions match the Canvas and Rasterizer renderers exactly
+				style := canvas.DefaultStyle
+				style.Fill = span.Face.Fill
+				r.RenderPath(span.ToPath(0.0), style, m.Translate(x, y).Rotate(float64(span.Rotation)))
+				return
+			}
 			if ok, _ := r.fonts[span.Face.Font]; !ok {
 				r.fonts[span.Face.Font] = true
 				r.fontSubset[span.Face.Font] = canvas.NewFontSubsetter()
