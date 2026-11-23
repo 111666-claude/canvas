@@ -23,6 +23,20 @@ jobs:
       run: go build -v ./...
     - name: Tests with coverage
       run: go test -race -v -count=1 -coverprofile=coverage.out ./...
+    - name: Render statistics gate
+      # The gate also runs as part of `go test ./...`, but this explicit run
+      # makes a failure (with its per-op diff) easy to find in the log and
+      # emits per-frame JSON for triage.
+      run: |
+          go test -race -count=1 ./renderstats
+          go test -count=1 ./renderstats -run TestGateBaseline -renderstats.emit=artifacts/renderstats
+    - name: Upload render statistics
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: renderstats
+        path: artifacts/renderstats
+        if-no-files-found: ignore
     - name: Upload Code Coverage
       uses: codecov/codecov-action@v5
       with:

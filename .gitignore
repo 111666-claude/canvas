@@ -9,6 +9,7 @@ test/*
 *.z
 *.map
 *.json
+!renderstats/testdata/*.json
 *.aux
 *.fls
 *.fdb_latexmk

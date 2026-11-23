@@ -1,0 +1,125 @@
+{
+  "schema": "renderstats.report",
+  "version": 1,
+  "tolerance": 0.000001,
+  "nanos_max": 250000000,
+  "frame_nanos_max": 5000000000,
+  "temp_bytes_max": 1048576,
+  "resource_count": 5,
+  "frames": [
+    {
+      "name": "gate",
+      "clip_set": false,
+      "clip_rect": {
+        "x0": 0,
+        "y0": 0,
+        "x1": 0,
+        "y1": 0,
+        "valid": false,
+        "empty": false
+      },
+      "ops": [
+        {
+          "kind": "path",
+          "local_bbox": {
+            "x0": 9.5,
+            "y0": -0.5,
+            "x1": 50.5,
+            "y1": 8,
+            "valid": true,
+            "empty": false
+          },
+          "world_bbox": {
+            "x0": 19.5,
+            "y0": 9.5,
+            "x1": 60.5,
+            "y1": 18,
+            "valid": true,
+            "empty": false
+          },
+          "clip_hit": "none"
+        },
+        {
+          "kind": "path",
+          "local_bbox": {
+            "x0": -0.5,
+            "y0": -0.5,
+            "x1": 20.5,
+            "y1": 12.5,
+            "valid": true,
+            "empty": false
+          },
+          "world_bbox": {
+            "x0": 44.5,
+            "y0": 14.5,
+            "x1": 65.5,
+            "y1": 27.5,
+            "valid": true,
+            "empty": false
+          },
+          "clip_hit": "none"
+        },
+        {
+          "kind": "text",
+          "local_bbox": {
+            "x0": 0,
+            "y0": -0.8319905598958334,
+            "x1": 22.036553276909725,
+            "y1": 3.2745632595486116,
+            "valid": true,
+            "empty": false
+          },
+          "world_bbox": {
+            "x0": 8,
+            "y0": 64.16800944010417,
+            "x1": 30.036553276909725,
+            "y1": 68.27456325954861,
+            "valid": true,
+            "empty": false
+          },
+          "clip_hit": "none"
+        },
+        {
+          "kind": "image",
+          "local_bbox": {
+            "x0": 3,
+            "y0": 4,
+            "x1": 7,
+            "y1": 8,
+            "valid": true,
+            "empty": false
+          },
+          "world_bbox": {
+            "x0": 71,
+            "y0": 28,
+            "x1": 79,
+            "y1": 36,
+            "valid": true,
+            "empty": false
+          },
+          "clip_hit": "none"
+        },
+        {
+          "kind": "path",
+          "local_bbox": {
+            "x0": -0.5,
+            "y0": -0.5,
+            "x1": 10.5,
+            "y1": 10.5,
+            "valid": true,
+            "empty": false
+          },
+          "world_bbox": {
+            "x0": 89.5,
+            "y0": 9.5,
+            "x1": 100.5,
+            "y1": 20.5,
+            "valid": true,
+            "empty": false
+          },
+          "clip_hit": "none"
+        }
+      ]
+    }
+  ]
+}
