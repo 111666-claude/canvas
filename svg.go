@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"io"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/tdewolff/parse/v2/css"
 	"github.com/tdewolff/parse/v2/xml"
 
+	"github.com/tdewolff/canvas/text"
 	"golang.org/x/net/html"
 )
 
@@ -29,6 +31,11 @@ type svgState struct {
 	textX            float64
 	textY            float64
 	textAnchor       string
+	textLength       float64
+	lengthAdjust     TextLengthAdjust
+	textPath         *Path
+	textPathStart    float64
+	textPathDY       float64
 	fontFamily       string
 	fontSize         float64
 	fillOpacity      float64
@@ -64,6 +71,7 @@ type svgParser struct {
 	cssRules []cssRule // from <style>
 	defs     map[string]svgDef
 	fonts    map[string]*FontFamily
+	paths    map[string]*Path // paths addressable by id, e.g. for textPath
 
 	// active definitions for attributes
 	activeDefs map[string]svgDef
@@ -126,7 +134,10 @@ func (svg *svgParser) pop() {
 		return
 	}
 	svg.elemStack = svg.elemStack[:len(svg.elemStack)-1]
+	// the current text position carries over to sibling elements
+	textX, textY := svg.state.textX, svg.state.textY
 	svg.state = svg.stateStack[len(svg.stateStack)-1]
+	svg.state.textX, svg.state.textY = textX, textY
 	svg.stateStack = svg.stateStack[:len(svg.stateStack)-1]
 	svg.ctx.Pop()
 }
@@ -765,6 +776,11 @@ func (svg *svgParser) parseDefs(l *xml.Lexer) {
 					}
 				}
 			}
+		case "path":
+			// register the path so that it can be referenced, e.g. by textPath
+			if p, err := ParseSVGPath(tag.attrs["d"]); err == nil {
+				svg.paths[id] = p
+			}
 		}
 	}
 }
@@ -1040,6 +1056,135 @@ func (svg *svgParser) getFontFace() *FontFace {
 	return fontFamily.Face(fontSize, svg.ctx.Style.Fill.Color)
 }
 
+// parseTextLength parses the textLength and lengthAdjust attributes. A zero textLength means that no adjustment is applied.
+func (svg *svgParser) parseTextLength(attrs map[string]string) (float64, TextLengthAdjust) {
+	length := 0.0
+	if v := attrs["textLength"]; v != "" {
+		length = svg.parseDimension(v, svg.width)
+	}
+	adjust := AdjustSpacing
+	if attrs["lengthAdjust"] == "spacingAndGlyphs" {
+		adjust = AdjustSpacingAndGlyphs
+	}
+	return length, adjust
+}
+
+// drawText draws a string at the current text position, applies the text length adjustment and text anchor, and advances the text position.
+func (svg *svgParser) drawText(s string) {
+	if s == "" {
+		return
+	}
+	text := NewTextLine(svg.getFontFace(), s, Left)
+	if svg.state.textLength != 0.0 {
+		text.SetTextLength(svg.state.textLength, svg.state.lengthAdjust)
+	}
+	x := svg.state.textX
+	if svg.state.textAnchor == "middle" {
+		x -= text.Width / 2.0
+	} else if svg.state.textAnchor == "end" {
+		x -= text.Width
+	}
+	svg.ctx.DrawText(x, svg.state.textY, text)
+	svg.state.textX += text.Width
+}
+
+// drawTextOnPath draws a string along the path of the enclosing textPath element. Glyphs are placed by their advance along the (flattened) path and rotated by the path's tangent. Glyphs that fall before the start or beyond the end of the path are placed on its end tangents. Line breaks are ignored, text on a path is single-line.
+func (svg *svgParser) drawTextOnPath(s string) {
+	path := svg.state.textPath
+	if path == nil || path.Empty() {
+		return
+	}
+	face := svg.getFontFace()
+	ppem := face.PPEM(DefaultResolution)
+
+	glyphs := make([]text.Glyph, 0, len(s))
+	for _, glyph := range face.Glyphs(s) {
+		if strings.ContainsAny(glyph.Text, "\n\r\u0085\u2028\u2029") {
+			continue // text on a path is single-line
+		}
+		glyphs = append(glyphs, glyph)
+	}
+	if len(glyphs) == 0 {
+		return
+	}
+
+	adv := make([]float64, len(glyphs))
+	total := 0.0
+	for i, glyph := range glyphs {
+		adv[i] = face.MmPerEm * float64(glyph.XAdvance)
+		total += adv[i]
+	}
+
+	// apply the text length adjustment
+	scale := 1.0 // glyph outline scale for spacingAndGlyphs
+	if validTextLength(svg.state.textLength) {
+		if svg.state.lengthAdjust == AdjustSpacingAndGlyphs {
+			if total != 0.0 {
+				scale = svg.state.textLength / total
+				for i := range adv {
+					adv[i] *= scale
+				}
+				total = svg.state.textLength
+			}
+		} else {
+			d := (svg.state.textLength - total) / float64(len(glyphs))
+			for i := range adv {
+				adv[i] += d
+			}
+			total = svg.state.textLength
+		}
+	}
+
+	// anchor the text along the path
+	start := svg.state.textPathStart
+	if svg.state.textAnchor == "middle" {
+		start -= total / 2.0
+	} else if svg.state.textAnchor == "end" {
+		start -= total
+	}
+
+	// flatten the path and accumulate the arclength at each vertex
+	pts := path.Flatten(Tolerance).Coords()
+	if len(pts) < 2 {
+		return
+	}
+	cum := make([]float64, len(pts))
+	for i := 1; i < len(pts); i++ {
+		cum[i] = cum[i-1] + pts[i].Sub(pts[i-1]).Length()
+	}
+	pathLen := cum[len(cum)-1]
+	pointAt := func(d float64) (Point, float64) {
+		if d <= 0.0 {
+			dir := pts[1].Sub(pts[0])
+			return pts[0], math.Atan2(dir.Y, dir.X) * 180.0 / math.Pi
+		} else if pathLen <= d {
+			dir := pts[len(pts)-1].Sub(pts[len(pts)-2])
+			return pts[len(pts)-1], math.Atan2(dir.Y, dir.X) * 180.0 / math.Pi
+		}
+		i := sort.Search(len(cum), func(i int) bool { return d <= cum[i] })
+		seg := pts[i].Sub(pts[i-1])
+		t := 0.0
+		if l := seg.Length(); l != 0.0 {
+			t = (d - cum[i-1]) / l
+		}
+		return pts[i-1].Add(seg.Mul(t)), math.Atan2(seg.Y, seg.X) * 180.0 / math.Pi
+	}
+
+	p := &Path{}
+	pos := start
+	for i, glyph := range glyphs {
+		mid := pos + adv[i]/2.0
+		point, angle := pointAt(mid)
+		gp, _ := face.toPath([]text.Glyph{glyph}, ppem)
+		// reflect the glyph to the SVG coordinate system (y-down), then rotate onto the path's tangent
+		m := Identity.Translate(point.X, point.Y).Rotate(angle).ReflectY().Translate(-adv[i]/2.0, -svg.state.textPathDY).Scale(scale, 1.0)
+		p = p.Append(gp.Transform(m))
+		pos += adv[i]
+	}
+	svg.ctx.DrawPath(0.0, 0.0, p)
+	svg.state.textX += total
+}
+
 func (svg *svgParser) drawShape(tag string, attrs map[string]string) {
 	switch tag {
 	case "circle":
@@ -1057,6 +1202,9 @@ func (svg *svgParser) drawShape(tag string, attrs map[string]string) {
 		p, err := ParseSVGPath(attrs["d"])
 		if err != nil && svg.err == nil {
 			svg.err = parse.NewErrorLexer(svg.z, "bad path: %w", err)
+		}
+		if id := attrs["id"]; id != "" && p != nil {
+			svg.paths[id] = p // register the path so that it can be referenced, e.g. by textPath
 		}
 		svg.ctx.DrawPath(0, 0, p)
 	case "polygon", "polyline":
@@ -1103,6 +1251,65 @@ func (svg *svgParser) drawShape(tag string, attrs map[string]string) {
 	case "text":
 		svg.state.textX = svg.parseDimension(attrs["x"], svg.width)
 		svg.state.textY = svg.parseDimension(attrs["y"], svg.height)
+		if v := attrs["dx"]; v != "" {
+			svg.state.textX += svg.parseDimension(v, svg.width)
+		}
+		if v := attrs["dy"]; v != "" {
+			svg.state.textY += svg.parseDimension(v, svg.height)
+		}
+		svg.state.textLength, svg.state.lengthAdjust = svg.parseTextLength(attrs)
+	case "tspan":
+		if svg.state.textPath != nil {
+			// inside a textPath, dx shifts along the path and dy perpendicular to it
+			if v := attrs["dx"]; v != "" {
+				svg.state.textPathStart += svg.parseDimension(v, svg.width)
+			}
+			if v := attrs["dy"]; v != "" {
+				svg.state.textPathDY += svg.parseDimension(v, svg.height)
+			}
+		} else {
+			if v := attrs["x"]; v != "" {
+				svg.state.textX = svg.parseDimension(v, svg.width)
+			}
+			if v := attrs["y"]; v != "" {
+				svg.state.textY = svg.parseDimension(v, svg.height)
+			}
+			if v := attrs["dx"]; v != "" {
+				svg.state.textX += svg.parseDimension(v, svg.width)
+			}
+			if v := attrs["dy"]; v != "" {
+				svg.state.textY += svg.parseDimension(v, svg.height)
+			}
+		}
+		if _, ok := attrs["textLength"]; ok {
+			svg.state.textLength, svg.state.lengthAdjust = svg.parseTextLength(attrs)
+		}
+	case "textPath":
+		href := attrs["href"]
+		if href == "" {
+			href = attrs["xlink:href"]
+		}
+		if strings.HasPrefix(href, "#") {
+			if p, ok := svg.paths[href[1:]]; ok {
+				svg.state.textPath = p
+			} else if svg.err == nil {
+				svg.err = parse.NewErrorLexer(svg.z, "bad textPath reference: %s", href)
+			}
+		}
+		svg.state.textPathStart = 0.0
+		svg.state.textPathDY = 0.0
+		if v := attrs["startOffset"]; v != "" {
+			if strings.HasSuffix(v, "%") {
+				if svg.state.textPath != nil {
+					svg.state.textPathStart = svg.parseNumber(v) * svg.state.textPath.Length()
+				}
+			} else {
+				svg.state.textPathStart = svg.parseDimension(v, svg.width)
+			}
+		}
+		if _, ok := attrs["textLength"]; ok {
+			svg.state.textLength, svg.state.lengthAdjust = svg.parseTextLength(attrs)
+		}
 	}
 }
 
@@ -1115,6 +1322,7 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 		z:          z,
 		defs:       map[string]svgDef{},
 		fonts:      map[string]*FontFamily{},
+		paths:      map[string]*Path{},
 		activeDefs: map[string]svgDef{},
 	}
 	for {
@@ -1196,16 +1404,13 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 		case xml.TextToken:
 			if 0 < len(svg.elemStack) {
 				tag := svg.elemStack[len(svg.elemStack)-1].tag
-				if tag == "text" {
-					textAlign := Left
-					if svg.state.textAnchor == "middle" {
-						textAlign = Center
-					} else if svg.state.textAnchor == "end" {
-						textAlign = Right
-					}
+				if tag == "text" || tag == "tspan" || tag == "textPath" {
 					t := html.UnescapeString(string(data))
-					text := NewTextLine(svg.getFontFace(), t, textAlign)
-					svg.ctx.DrawText(svg.state.textX, svg.state.textY, text)
+					if svg.state.textPath != nil {
+						svg.drawTextOnPath(t)
+					} else {
+						svg.drawText(t)
+					}
 				}
 			}
 		case xml.EndTagToken:

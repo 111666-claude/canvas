@@ -461,6 +461,12 @@ func (r *SVG) RenderText(text *canvas.Text, m canvas.Matrix) {
 			fill, fillOpacity := r.writePaint(span.Face.Fill, m)
 			fmt.Fprintf(r.w, `<tspan x="%v" y="%v`, num(x), num(y))
 			r.writeFontStyle(span.Face, faceMain, span.Direction == ctext.RightToLeft, fill, fillOpacity)
+			if span.TextLength != 0.0 {
+				fmt.Fprintf(r.w, `" textLength="%v`, num(span.TextLength))
+				if span.LengthAdjust == canvas.AdjustSpacingAndGlyphs {
+					fmt.Fprintf(r.w, `" lengthAdjust="spacingAndGlyphs`)
+				}
+			}
 			r.writeClasses(r.w)
 			fmt.Fprintf(r.w, `">`)
 			xml.EscapeText(r.w, []byte(span.Text))

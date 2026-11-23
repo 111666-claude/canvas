@@ -131,3 +131,67 @@ func TestSplitAlpha(t *testing.T) {
 		test.Float(t, opacity, tt.opacity)
 	}
 }
+
+// Text spans with a text length adjustment are written out with the textLength and
+// lengthAdjust attributes so that the adjustment survives the round trip through SVG.
+func TestSVGTextLength(t *testing.T) {
+	family := canvas.NewFontFamily("dejavu-serif")
+	if err := family.LoadFontFile("../../resources/DejaVuSerif.ttf", canvas.FontRegular); err != nil {
+		test.Error(t, err)
+	}
+	face := family.Face(12.0*0.3527777778, canvas.Black, canvas.FontRegular, canvas.FontNormal)
+
+	newText := func(adjust canvas.TextLengthAdjust) *canvas.Text {
+		text := canvas.NewTextLine(face, "Hello", canvas.Left)
+		text.SetTextLength(40.0, adjust)
+		return text
+	}
+
+	s := renderSVG(func(ctx *canvas.Context) {
+		ctx.DrawText(10.0, 20.0, newText(canvas.AdjustSpacing))
+	})
+	test.That(t, strings.Contains(s, `textLength="40"`), "expected textLength attribute in:", s)
+	test.That(t, !strings.Contains(s, `lengthAdjust`), "unexpected lengthAdjust attribute in:", s)
+
+	s = renderSVG(func(ctx *canvas.Context) {
+		ctx.DrawText(10.0, 20.0, newText(canvas.AdjustSpacingAndGlyphs))
+	})
+	test.That(t, strings.Contains(s, `textLength="40"`), "expected textLength attribute in:", s)
+	test.That(t, strings.Contains(s, `lengthAdjust="spacingAndGlyphs"`), "expected lengthAdjust attribute in:", s)
+
+	// no adjustment, no attributes
+	s = renderSVG(func(ctx *canvas.Context) {
+		ctx.DrawText(10.0, 20.0, canvas.NewTextLine(face, "Hello", canvas.Left))
+	})
+	test.That(t, !strings.Contains(s, `textLength`), "unexpected textLength attribute in:", s)
+}
+
+// A text length adjustment survives the round trip: SVG import, canvas, SVG export, reimport.
+func TestSVGTextLengthRoundTrip(t *testing.T) {
+	family := canvas.NewFontFamily("serif")
+	if err := family.LoadSystemFont("serif", canvas.FontRegular); err != nil {
+		t.Skip("no system font available:", err)
+	}
+
+	src := `<svg width="300" height="100"><text x="10" y="20" textLength="200" lengthAdjust="spacingAndGlyphs">Hello</text></svg>`
+	c, err := canvas.ParseSVG(strings.NewReader(src))
+	test.Error(t, err)
+
+	buf := &bytes.Buffer{}
+	r := New(buf, 300.0, 100.0, nil)
+	c.RenderTo(r)
+	test.Error(t, r.Close())
+	out := buf.String()
+	test.That(t, strings.Contains(out, `textLength="200"`), "expected textLength in:", out)
+	test.That(t, strings.Contains(out, `lengthAdjust="spacingAndGlyphs"`), "expected lengthAdjust in:", out)
+
+	// reimport and render again: the adjustment is preserved
+	c2, err := canvas.ParseSVG(strings.NewReader(out))
+	test.Error(t, err)
+	buf2 := &bytes.Buffer{}
+	r2 := New(buf2, 300.0, 100.0, nil)
+	c2.RenderTo(r2)
+	test.Error(t, r2.Close())
+	out2 := buf2.String()
+	test.That(t, strings.Contains(out2, `textLength="200"`), "expected textLength after round trip in:", out2)
+}

@@ -184,6 +184,32 @@ func (l line) Heights(mode WritingMode) (float64, float64, float64, float64) {
 	return top, ascent, descent, bottom
 }
 
+// TextLengthAdjust specifies how a text span is adjusted to fit a target length, see the SVG textLength and lengthAdjust attributes.
+type TextLengthAdjust int
+
+// see TextLengthAdjust
+const (
+	// AdjustSpacing adjusts only the spacing between glyphs to fit the target text length, glyph outlines are not affected.
+	AdjustSpacing TextLengthAdjust = iota
+	// AdjustSpacingAndGlyphs adjusts both the spacing between glyphs and the glyph outlines themselves (scaled along the text advance direction) to fit the target text length.
+	AdjustSpacingAndGlyphs
+)
+
+func (adjust TextLengthAdjust) String() string {
+	switch adjust {
+	case AdjustSpacing:
+		return "spacing"
+	case AdjustSpacingAndGlyphs:
+		return "spacingAndGlyphs"
+	}
+	return "Invalid(" + strconv.Itoa(int(adjust)) + ")"
+}
+
+// validTextLength returns true if the target text length is a positive, finite number. Zero, negative and non-finite lengths are invalid and disable the adjustment.
+func validTextLength(length float64) bool {
+	return 0.0 < length && !math.IsNaN(length) && !math.IsInf(length, 0)
+}
+
 // TextSpan is a span of text.
 type TextSpan struct {
 	X         float64
@@ -195,12 +221,62 @@ type TextSpan struct {
 	Rotation  text.Rotation
 	Level     int
 
+	// TextLength is the target advance length in millimeters as set by SetTextLength, it is zero when no text length adjustment is applied.
+	TextLength   float64
+	LengthAdjust TextLengthAdjust
+
 	Objects []TextSpanObject
 }
 
 // IsText returns true if the text span is text and not objects (such as images or paths).
 func (span *TextSpan) IsText() bool {
 	return len(span.Objects) == 0
+}
+
+// SetTextLength adjusts the advance of the text span to be exactly length millimeters, see the SVG textLength and lengthAdjust attributes. For AdjustSpacing only the spacing between glyphs is adjusted and the glyph outlines are left untouched, for AdjustSpacingAndGlyphs the glyph outlines are scaled along the advance direction as well. The adjustment is exact up to the font's units-per-em quantization of the glyph advances.
+//
+// A zero, negative or non-finite length disables the adjustment and leaves the span unchanged. Spans without glyphs (such as object spans) are never adjusted. Missing glyphs (.notdef) participate in the adjustment like any other glyph. For AdjustSpacingAndGlyphs a span with zero natural advance cannot be scaled and is left unchanged.
+func (span *TextSpan) SetTextLength(length float64, adjust TextLengthAdjust) {
+	if !span.IsText() || len(span.Glyphs) == 0 {
+		return
+	}
+	if !validTextLength(length) {
+		return
+	}
+	if adjust == AdjustSpacingAndGlyphs {
+		if natural := span.Face.textWidth(span.Glyphs); natural != 0.0 {
+			// glyph outlines are scaled at render time by Width/natural
+			span.Width = length
+			span.TextLength = length
+			span.LengthAdjust = adjust
+		}
+		return
+	}
+	span.adjustSpacing(length - span.Face.textWidth(span.Glyphs))
+	span.Width = length
+	span.TextLength = length
+	span.LengthAdjust = adjust
+}
+
+// adjustSpacing adds delta millimeters to the advance of the span, distributed evenly over all glyphs. The last glyph absorbs the rounding remainder so that the total advance is exact up to the font's units-per-em quantization. UTF-8 cluster boundaries are unaffected as only glyph advances change.
+func (span *TextSpan) adjustSpacing(delta float64) {
+	n := len(span.Glyphs)
+	if n == 0 || delta == 0.0 {
+		return
+	}
+	d := int64(math.Round(delta / span.Face.MmPerEm)) // in font units
+	per := d / int64(n)
+	for i := range span.Glyphs {
+		di := per
+		if i == n-1 {
+			di = d - per*int64(n-1)
+		}
+		if span.Glyphs[i].Vertical {
+			span.Glyphs[i].YAdvance -= int32(di)
+		} else {
+			span.Glyphs[i].XAdvance += int32(di)
+		}
+	}
 }
 
 // TextSpanObject is an object that can be used within a text span. It is a wrapper around Canvas and can thus draw anything to be mixed with text, such as images (emoticons) or paths (symbols).
@@ -1057,6 +1133,84 @@ func (rt *RichText) ToText(width, height float64, halign, valign TextAlign, opts
 	return t
 }
 
+// SetTextLength adjusts every line of the text to advance exactly length millimeters, see the SVG textLength and lengthAdjust attributes. For AdjustSpacing the extra (or removed) advance is distributed evenly over all glyphs of each line, for AdjustSpacingAndGlyphs each line is scaled along the advance direction as a whole. Spans are repositioned so that each line keeps its original starting position. Lines without glyphs (e.g. only objects) are not adjusted. Line breaking is not re-run, the adjustment applies to the rendered advance only.
+//
+// A zero, negative or non-finite length disables the adjustment and leaves the text unchanged. Missing glyphs (.notdef) participate in the adjustment like any other glyph.
+func (t *Text) SetTextLength(length float64, adjust TextLengthAdjust) {
+	if !validTextLength(length) {
+		return
+	}
+	for j := range t.lines {
+		line := &t.lines[j]
+		if len(line.spans) == 0 {
+			continue
+		}
+		total, n := 0.0, 0
+		for _, span := range line.spans {
+			total += span.Width
+			if span.IsText() {
+				n += len(span.Glyphs)
+			}
+		}
+		if total == 0.0 || n == 0 {
+			continue
+		}
+
+		x := line.spans[0].X
+		if adjust == AdjustSpacingAndGlyphs {
+			s := length / total
+			for i := range line.spans {
+				span := &line.spans[i]
+				span.X = x
+				span.Width *= s
+				if span.IsText() && 0 < len(span.Glyphs) {
+					span.TextLength = span.Width
+					span.LengthAdjust = AdjustSpacingAndGlyphs
+				}
+				x += span.Width
+			}
+		} else {
+			perGlyph := (length - total) / float64(n) // in millimeters
+			for i := range line.spans {
+				span := &line.spans[i]
+				span.X = x
+				if span.IsText() && 0 < len(span.Glyphs) {
+					span.adjustSpacing(perGlyph * float64(len(span.Glyphs)))
+					span.Width = span.Face.textWidth(span.Glyphs)
+				}
+				x += span.Width
+			}
+			// absorb the font-units rounding error in the last text span so that the line advances exactly length
+			if diff := length - (x - line.spans[0].X); diff != 0.0 {
+				for i := len(line.spans) - 1; 0 <= i; i-- {
+					span := &line.spans[i]
+					if span.IsText() && 0 < len(span.Glyphs) {
+						span.adjustSpacing(diff)
+						span.Width += diff
+						break
+					}
+				}
+			}
+			for i := range line.spans {
+				span := &line.spans[i]
+				if span.IsText() && 0 < len(span.Glyphs) {
+					span.TextLength = span.Width
+					span.LengthAdjust = AdjustSpacing
+				}
+			}
+		}
+	}
+
+	// update the text box width
+	t.Width = 0.0
+	for _, line := range t.lines {
+		if 0 < len(line.spans) {
+			last := line.spans[len(line.spans)-1]
+			t.Width = math.Max(t.Width, last.X+last.Width)
+		}
+	}
+}
+
 // String returns the content of the text box.
 func (t *Text) String() string {
 	return t.Text
@@ -1274,6 +1428,18 @@ func (t *Text) renderLineTo(r Renderer, m Matrix, resolution Resolution, index i
 		ys[i] = y
 		if span.IsText() {
 			ps[i], _ = span.Face.toPath(span.Glyphs, span.Face.PPEM(resolution))
+			if span.LengthAdjust == AdjustSpacingAndGlyphs && span.TextLength != 0.0 {
+				// scale the glyph outlines along the advance direction, the advances are already reflected in span.Width
+				if natural := span.Face.textWidth(span.Glyphs); natural != 0.0 {
+					if s := span.Width / natural; s != 1.0 {
+						if 0 < len(span.Glyphs) && span.Glyphs[0].Vertical {
+							ps[i] = ps[i].Transform(Identity.Scale(1.0, s))
+						} else {
+							ps[i] = ps[i].Transform(Identity.Scale(s, 1.0))
+						}
+					}
+				}
+			}
 		}
 	}
 

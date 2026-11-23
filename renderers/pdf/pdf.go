@@ -234,10 +234,29 @@ func (r *PDF) RenderText(text *canvas.Text, m canvas.Matrix) {
 			style := canvas.DefaultStyle
 			style.Fill = span.Face.Fill
 
+			tm := m.Translate(x, y).Shear(span.Face.FauxItalic, 0.0)
+			if span.LengthAdjust == canvas.AdjustSpacingAndGlyphs && span.TextLength != 0.0 {
+				// scale the glyphs along the advance direction, see Text.SetTextLength
+				natural := 0.0
+				for _, glyph := range span.Glyphs {
+					if !glyph.Vertical {
+						natural += float64(glyph.XAdvance)
+					} else {
+						natural -= float64(glyph.YAdvance)
+					}
+				}
+				natural *= span.Face.MmPerEm
+				if natural != 0.0 {
+					if s := span.Width / natural; s != 1.0 {
+						tm = tm.Scale(s, 1.0)
+					}
+				}
+			}
+
 			r.w.StartTextObject()
 			r.w.SetFill(span.Face.Fill, m)
 			r.w.SetFont(span.Face.Font, span.Face.Size, span.Direction)
-			r.w.SetTextPosition(m.Translate(x, y).Shear(span.Face.FauxItalic, 0.0))
+			r.w.SetTextPosition(tm)
 
 			if 0.0 < span.Face.FauxBold {
 				r.w.SetTextRenderMode(2)
