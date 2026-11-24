@@ -2,8 +2,13 @@ package canvas
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
+	"image"
 	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"math"
 	"strconv"
@@ -19,9 +24,11 @@ import (
 type svgDef func(string, *Canvas)
 
 type svgElem struct {
-	tag   string
-	id    string
-	attrs map[string]string
+	tag        string
+	id         string
+	attrs      map[string]string
+	maskID     string // mask referenced by this element, applied when it is popped
+	layerStart int    // number of layers present when this element was pushed
 }
 
 type svgState struct {
@@ -63,10 +70,24 @@ type svgParser struct {
 
 	cssRules []cssRule // from <style>
 	defs     map[string]svgDef
+	maskDefs map[string]*svgTag
 	fonts    map[string]*FontFamily
 
 	// active definitions for attributes
 	activeDefs map[string]svgDef
+
+	viewbox      [4]float64
+	maskStack    []string // mask IDs currently being built, to detect circular references
+	pendingMasks []svgPendingMask
+}
+
+// svgPendingMask is a mask application that was deferred because the mask is defined later in the document.
+type svgPendingMask struct {
+	id                   string
+	c                    *Canvas
+	zindex               int
+	layerStart, layerEnd int
+	view                 Matrix // user space of the referencing element to canvas coordinates
 }
 
 func (svg *svgParser) parseViewBox(attrWidth, attrHeight, attrViewBox string) (float64, float64, [4]float64) {
@@ -102,6 +123,9 @@ func (svg *svgParser) parseViewBox(attrWidth, attrHeight, attrViewBox string) (f
 func (svg *svgParser) init(width, height float64, viewbox [4]float64) {
 	svg.width, svg.height = width*96.0/25.4, height*96.0/25.4
 	svg.diagonal = math.Sqrt((svg.width*svg.width + svg.height*svg.height) / 2.0)
+	if viewbox != ([4]float64{}) {
+		svg.viewbox = viewbox
+	}
 
 	svg.c = New(width, height)
 	svg.ctx = NewContext(svg.c)
@@ -117,7 +141,12 @@ func (svg *svgParser) init(width, height float64, viewbox [4]float64) {
 func (svg *svgParser) push(tag string, attrs map[string]string) {
 	svg.ctx.Push()
 	svg.stateStack = append(svg.stateStack, svg.state)
-	svg.elemStack = append(svg.elemStack, svgElem{tag, attrs["id"], attrs})
+	svg.elemStack = append(svg.elemStack, svgElem{
+		tag:        tag,
+		id:         attrs["id"],
+		attrs:      attrs,
+		layerStart: len(svg.c.layers[svg.c.zindex]),
+	})
 }
 
 func (svg *svgParser) pop() {
@@ -125,9 +154,28 @@ func (svg *svgParser) pop() {
 		svg.err = parse.NewErrorLexer(svg.z, "invalid SVG")
 		return
 	}
+	elem := svg.elemStack[len(svg.elemStack)-1]
 	svg.elemStack = svg.elemStack[:len(svg.elemStack)-1]
 	svg.state = svg.stateStack[len(svg.stateStack)-1]
 	svg.stateStack = svg.stateStack[:len(svg.stateStack)-1]
+	if elem.maskID != "" {
+		// apply the mask while the element's user space is still in effect; if the mask
+		// is defined later in the document, defer application until the end of parsing
+		view := svg.ctx.CoordSystemView().Mul(svg.ctx.View())
+		pm := svgPendingMask{
+			id:         elem.maskID,
+			c:          svg.c,
+			zindex:     svg.c.zindex,
+			layerStart: elem.layerStart,
+			layerEnd:   len(svg.c.layers[svg.c.zindex]),
+			view:       view,
+		}
+		if _, ok := svg.maskDefs[elem.maskID]; ok {
+			svg.applyMask(pm)
+		} else {
+			svg.pendingMasks = append(svg.pendingMasks, pm)
+		}
+	}
 	svg.ctx.Pop()
 }
 
@@ -383,6 +431,7 @@ type svgTag struct {
 	attrNames []string
 	attrs     map[string]string
 	content   []*svgTag
+	text      string // text content, used by <text> elements inside masks
 }
 
 func (svg *svgParser) parseTag(l *xml.Lexer) *svgTag {
@@ -442,6 +491,8 @@ func (svg *svgParser) parseTag(l *xml.Lexer) *svgTag {
 			if parent == nil {
 				break
 			}
+		} else if tt == xml.TextToken && parent != nil {
+			parent.text += string(data)
 		}
 	}
 	return root
@@ -458,6 +509,8 @@ func (svg *svgParser) parseDefs(l *xml.Lexer) {
 			continue
 		}
 		switch tag.name {
+		case "mask":
+			svg.maskDefs[id] = tag
 		case "linearGradient":
 			if _, ok := tag.attrs["x2"]; !ok {
 				tag.attrs["x2"] = "100%"
@@ -1003,7 +1056,18 @@ func (svg *svgParser) setAttribute(key, val string) {
 		}
 	case "transform":
 		m := svg.parseTransform(val)
+		if !finiteMatrix(m) && svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "non-finite transform: %s", val)
+		}
 		svg.ctx.ComposeView(m)
+	case "mask":
+		if id := svg.parseUrlID(val); id != "" {
+			if 0 < len(svg.elemStack) {
+				svg.elemStack[len(svg.elemStack)-1].maskID = id
+			}
+		} else if val != "" && val != "none" && svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "bad mask reference: %s", val)
+		}
 	case "text-anchor":
 		svg.state.textAnchor = val
 	case "font-family":
@@ -1103,7 +1167,354 @@ func (svg *svgParser) drawShape(tag string, attrs map[string]string) {
 	case "text":
 		svg.state.textX = svg.parseDimension(attrs["x"], svg.width)
 		svg.state.textY = svg.parseDimension(attrs["y"], svg.height)
+	case "image":
+		href := attrs["xlink:href"]
+		if href == "" {
+			href = attrs["href"]
+		}
+		img := svg.parseImage(href)
+		if img == nil {
+			break
+		}
+		x := svg.parseDimension(attrs["x"], svg.width)
+		y := svg.parseDimension(attrs["y"], svg.height)
+		size := img.Bounds().Size()
+		width, height := float64(size.X), float64(size.Y)
+		if attrs["width"] != "" {
+			width = svg.parseDimension(attrs["width"], svg.width)
+		}
+		if attrs["height"] != "" {
+			height = svg.parseDimension(attrs["height"], svg.height)
+		}
+		if 0.0 < width && 0.0 < height {
+			svg.ctx.FitImage(img, Rect{x, y, x + width, y + height}, ImageFill)
+		}
 	}
+}
+
+// parseImage decodes an image from a data URI. External references are not supported and return nil.
+func (svg *svgParser) parseImage(href string) image.Image {
+	if !strings.HasPrefix(href, "data:") {
+		return nil
+	}
+	i := strings.IndexByte(href, ',')
+	if i == -1 {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "bad image data URI")
+		}
+		return nil
+	}
+	var r io.Reader = strings.NewReader(href[i+1:])
+	if strings.HasSuffix(href[5:i], ";base64") {
+		r = base64.NewDecoder(base64.StdEncoding, r)
+	}
+	img, _, err := image.Decode(r)
+	if err != nil {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "bad image: %w", err)
+		}
+		return nil
+	}
+	return img
+}
+
+// maxSVGMaskExtent is the maximum allowed mask region extent in user units. Larger mask regions are rejected to avoid excessive rasterization sizes.
+const maxSVGMaskExtent = 1.0e6
+
+func finiteMatrix(m Matrix) bool {
+	for i := 0; i < 2; i++ {
+		for j := 0; j < 3; j++ {
+			if math.IsNaN(m[i][j]) || math.IsInf(m[i][j], 0) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func finiteRect(r Rect) bool {
+	return finiteMatrix(Matrix{{r.X0, r.Y0, 0.0}, {r.X1, r.Y1, 0.0}})
+}
+
+// parseFraction parses a number or percentage as a fraction, returning def when v is empty.
+func (svg *svgParser) parseFraction(v string, def float64) float64 {
+	if v == "" {
+		return def
+	}
+	return svg.parseNumber(v)
+}
+
+// parseDimensionDefault parses a dimension, returning def when v is empty.
+func (svg *svgParser) parseDimensionDefault(v string, parent, def float64) float64 {
+	if v == "" {
+		return def
+	}
+	return svg.parseDimension(v, parent)
+}
+
+// svgLayerBounds returns the bounds of a single layer in canvas coordinates.
+func svgLayerBounds(l layer) Rect {
+	bounds := Rect{}
+	if l.path != nil {
+		bounds = l.path.Bounds()
+		if l.style.HasStroke() {
+			hw := l.style.StrokeWidth / 2.0
+			bounds.X0 -= hw
+			bounds.Y0 -= hw
+			bounds.X1 += hw
+			bounds.Y1 += hw
+		}
+	} else if l.text != nil {
+		bounds = l.text.Bounds()
+	} else if l.img != nil {
+		size := l.img.Bounds().Size()
+		bounds = Rect{0.0, 0.0, float64(size.X), float64(size.Y)}
+	}
+	if bounds.Empty() {
+		return Rect{}
+	}
+	return bounds.Transform(l.m)
+}
+
+// applyPendingMasks applies all deferred mask applications. It is called at the end of parsing, when all mask definitions are known. Pending masks are processed in reverse order of recording so that layer removals (for empty masks) do not invalidate the layer ranges of masks that are applied later.
+func (svg *svgParser) applyPendingMasks() {
+	for 0 < len(svg.pendingMasks) {
+		pm := svg.pendingMasks[len(svg.pendingMasks)-1]
+		svg.pendingMasks = svg.pendingMasks[:len(svg.pendingMasks)-1]
+		svg.applyMask(pm)
+	}
+}
+
+// applyMask builds the mask referenced by pm.id and attaches it to the layers [layerStart, layerEnd) of pm.c. The mask content is rendered as an independent layer (its own canvas) in the coordinate space of pm.c, so that the masked content and the mask composite as a single transparency group.
+func (svg *svgParser) applyMask(pm svgPendingMask) {
+	if svg.err != nil {
+		return
+	}
+	tag, ok := svg.maskDefs[pm.id]
+	if !ok {
+		return // unresolved mask reference: render unmasked
+	}
+	for _, activeID := range svg.maskStack {
+		if activeID == pm.id {
+			svg.err = parse.NewErrorLexer(svg.z, "circular mask reference: %s", pm.id)
+			return
+		}
+	}
+	layers := pm.c.layers[pm.zindex]
+	if pm.layerStart < 0 || pm.layerEnd < pm.layerStart || len(layers) < pm.layerEnd {
+		return
+	}
+	hide := func() {
+		// a fully transparent mask (empty mask, empty mask region, ...) hides the masked content
+		for i := pm.layerStart; i < pm.layerEnd; i++ {
+			layers[i].hidden = true
+		}
+	}
+	if pm.layerStart == pm.layerEnd {
+		return // nothing was rendered for this element
+	}
+	if len(tag.content) == 0 {
+		hide() // an empty mask is fully transparent
+		return
+	}
+
+	// mask type: luminance (default) or alpha
+	luminance := true
+	maskType := tag.attrs["mask-type"]
+	if maskType == "" {
+		for _, prop := range svg.parseStyleAttribute(tag.attrs["style"]) {
+			if prop.key == "mask-type" {
+				maskType = prop.val
+			}
+		}
+	}
+	switch maskType {
+	case "", "luminance":
+	case "alpha":
+		luminance = false
+	default:
+		svg.err = parse.NewErrorLexer(svg.z, "invalid mask-type: %s", maskType)
+		return
+	}
+
+	// mask units
+	maskUnits := tag.attrs["maskUnits"]
+	if maskUnits == "" {
+		maskUnits = "objectBoundingBox"
+	} else if maskUnits != "objectBoundingBox" && maskUnits != "userSpaceOnUse" {
+		svg.err = parse.NewErrorLexer(svg.z, "invalid maskUnits: %s", maskUnits)
+		return
+	}
+	maskContentUnits := tag.attrs["maskContentUnits"]
+	if maskContentUnits == "" {
+		maskContentUnits = "userSpaceOnUse"
+	} else if maskContentUnits != "objectBoundingBox" && maskContentUnits != "userSpaceOnUse" {
+		svg.err = parse.NewErrorLexer(svg.z, "invalid maskContentUnits: %s", maskContentUnits)
+		return
+	}
+
+	// union of the masked layers' bounds in canvas coordinates
+	bbox := Rect{}
+	for _, l := range layers[pm.layerStart:pm.layerEnd] {
+		b := svgLayerBounds(l)
+		if b.Empty() {
+			continue
+		}
+		if bbox.Empty() {
+			bbox = b
+		} else {
+			bbox = bbox.Add(b)
+		}
+	}
+
+	// transformation of the referencing element's user space to canvas coordinates
+	view := pm.view
+	if !finiteMatrix(view) {
+		svg.err = parse.NewErrorLexer(svg.z, "non-finite transform for mask: %s", pm.id)
+		return
+	}
+
+	// mask region and content transformation, both in canvas coordinates
+	var rect Rect
+	var contentView Matrix
+	if maskUnits == "objectBoundingBox" {
+		if bbox.Empty() {
+			hide() // no bounding box to resolve the mask region against
+			return
+		}
+		x := svg.parseFraction(tag.attrs["x"], -0.10)
+		y := svg.parseFraction(tag.attrs["y"], -0.10)
+		w := svg.parseFraction(tag.attrs["width"], 1.20)
+		h := svg.parseFraction(tag.attrs["height"], 1.20)
+		if svg.err != nil {
+			return
+		}
+		if w <= 0.0 || h <= 0.0 {
+			hide() // a mask region of zero or negative size disables rendering
+			return
+		}
+		rect = Rect{bbox.X0 + x*bbox.W(), bbox.Y0 + y*bbox.H(), bbox.X0 + (x+w)*bbox.W(), bbox.Y0 + (y+h)*bbox.H()}
+	} else {
+		vw, vh := pm.c.W, pm.c.H
+		if 0.0 < svg.viewbox[2] && 0.0 < svg.viewbox[3] {
+			vw, vh = svg.viewbox[2], svg.viewbox[3]
+		}
+		x := svg.parseDimensionDefault(tag.attrs["x"], vw, -0.10*vw)
+		y := svg.parseDimensionDefault(tag.attrs["y"], vh, -0.10*vh)
+		w := svg.parseDimensionDefault(tag.attrs["width"], vw, 1.20*vw)
+		h := svg.parseDimensionDefault(tag.attrs["height"], vh, 1.20*vh)
+		if svg.err != nil {
+			return
+		}
+		if w <= 0.0 || h <= 0.0 {
+			hide()
+			return
+		}
+		rect = Rect{x, y, x + w, y + h}.Transform(view)
+	}
+	if maskContentUnits == "objectBoundingBox" {
+		if bbox.Empty() {
+			hide()
+			return
+		}
+		contentView = Identity.Translate(bbox.X0, bbox.Y0).Scale(bbox.W(), bbox.H())
+	} else {
+		contentView = view
+	}
+	if !finiteRect(rect) || !finiteMatrix(contentView) {
+		svg.err = parse.NewErrorLexer(svg.z, "non-finite mask geometry: %s", pm.id)
+		return
+	}
+	if maxSVGMaskExtent < rect.W() || maxSVGMaskExtent < rect.H() {
+		svg.err = parse.NewErrorLexer(svg.z, "mask region too large: %s", pm.id)
+		return
+	}
+
+	// render the mask content as an independent layer in canvas coordinates
+	maskCanvas := New(pm.c.W, pm.c.H)
+	origCanvas := svg.svgCanvas
+	origState := svg.state
+	svg.c = maskCanvas
+	svg.ctx = NewContext(maskCanvas)
+	svg.ctx.SetCoordSystem(CartesianI)
+	svg.ctx.SetView(contentView)
+	svg.ctx.SetStrokeJoiner(MiterJoiner{BevelJoin, svgDefaultState.strokeMiterLimit})
+	svg.state = svgDefaultState
+	svg.maskStack = append(svg.maskStack, pm.id)
+	for _, child := range tag.content {
+		svg.drawTag(child)
+	}
+	svg.maskStack = svg.maskStack[:len(svg.maskStack)-1]
+	svg.svgCanvas = origCanvas
+	svg.state = origState
+	if svg.err != nil {
+		return
+	}
+	if maskCanvas.Empty() {
+		hide()
+		return
+	}
+
+	mask := &Mask{Canvas: maskCanvas, Rect: rect, Luminance: luminance}
+	layers = pm.c.layers[pm.zindex]
+	for i := pm.layerStart; i < pm.layerEnd; i++ {
+		if layers[i].mask != nil {
+			// an inner mask is already in effect (e.g. mask on both element and group), chain both masks so that their values multiply
+			layers[i].mask = &Mask{Canvas: mask.Canvas, Rect: mask.Rect, Luminance: mask.Luminance, Next: layers[i].mask}
+		} else {
+			layers[i].mask = mask
+		}
+	}
+}
+
+// drawTag replays a parsed tag tree, such as the content of a mask element, into the current canvas.
+func (svg *svgParser) drawTag(tag *svgTag) {
+	svg.push(tag.name, tag.attrs)
+
+	props := []cssProperty{}
+	for _, key := range tag.attrNames {
+		props = append(props, cssProperty{key, tag.attrs[key]})
+	}
+	svg.setStyling(props)
+
+	svg.drawShape(tag.name, tag.attrs)
+
+	for attr, applyDef := range svg.activeDefs {
+		if applyDef != nil {
+			applyDef(attr, svg.c)
+		}
+		svg.activeDefs[attr] = nil
+	}
+
+	if tag.name == "text" {
+		svg.drawTagText(tag)
+	}
+	for _, child := range tag.content {
+		svg.drawTag(child)
+	}
+	svg.pop()
+}
+
+// drawTagText draws the text content of a <text> tag, including its <tspan> children.
+func (svg *svgParser) drawTagText(tag *svgTag) {
+	s := tag.text
+	for _, child := range tag.content {
+		if child.name == "tspan" {
+			s += child.text
+		}
+	}
+	s = html.UnescapeString(s)
+	if strings.TrimSpace(s) == "" {
+		return
+	}
+	textAlign := Left
+	if svg.state.textAnchor == "middle" {
+		textAlign = Center
+	} else if svg.state.textAnchor == "end" {
+		textAlign = Right
+	}
+	text := NewTextLine(svg.getFontFace(), s, textAlign)
+	svg.ctx.DrawText(svg.state.textX, svg.state.textY, text)
 }
 
 func ParseSVG(r io.Reader) (*Canvas, error) {
@@ -1114,6 +1525,7 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 	svg := svgParser{
 		z:          z,
 		defs:       map[string]svgDef{},
+		maskDefs:   map[string]*svgTag{},
 		fonts:      map[string]*FontFamily{},
 		activeDefs: map[string]svgDef{},
 	}
@@ -1123,7 +1535,9 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 		case xml.ErrorToken:
 			if l.Err() != io.EOF {
 				return svg.c, l.Err()
-			} else if svg.err != nil {
+			}
+			svg.applyPendingMasks()
+			if svg.err != nil {
 				return svg.c, svg.err
 			} else if svg.c == nil {
 				return svg.c, fmt.Errorf("expected SVG tag")
@@ -1163,6 +1577,38 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 			} else if tag == "defs" {
 				if tt != xml.StartTagCloseVoidToken {
 					svg.parseDefs(l)
+				}
+				break
+			} else if tag == "mask" {
+				// masks are never rendered directly, register for later reference
+				maskTag := &svgTag{name: "mask", attrNames: attrNames, attrs: attrs}
+				if tt != xml.StartTagCloseVoidToken {
+					for {
+						child := svg.parseTag(l)
+						if child == nil {
+							break
+						}
+						maskTag.content = append(maskTag.content, child)
+					}
+				}
+				if id := attrs["id"]; id != "" {
+					svg.maskDefs[id] = maskTag
+				}
+				break
+			} else if tag == "mask" {
+				// masks are never rendered directly, register for later reference
+				maskTag := &svgTag{name: "mask", attrNames: attrNames, attrs: attrs}
+				if tt != xml.StartTagCloseVoidToken {
+					for {
+						child := svg.parseTag(l)
+						if child == nil {
+							break
+						}
+						maskTag.content = append(maskTag.content, child)
+					}
+				}
+				if id := attrs["id"]; id != "" {
+					svg.maskDefs[id] = maskTag
 				}
 				break
 			}

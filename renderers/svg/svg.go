@@ -43,6 +43,7 @@ type SVG struct {
 	fonts         map[*canvas.Font]bool
 	fontSubset    map[*canvas.Font]*canvas.FontSubsetter
 	maskID        int
+	pendingMask   *canvas.Mask
 	defs          map[any][2]string
 	classes       []string
 	customStyle   string
@@ -162,6 +163,48 @@ func (r *SVG) SetImageEncoding(enc cimage.ImageEncoding) {
 	r.opts.ImageEncoding = enc
 }
 
+// SetMask sets the mask to be applied to the next rendered layer. A nil mask clears the current mask. It implements the canvas.MaskRenderer interface. Masks are written out as native SVG mask elements; chained masks (Mask.Next) are not supported and only the first mask is written.
+func (r *SVG) SetMask(mask *canvas.Mask) {
+	r.pendingMask = mask
+}
+
+// writeMask writes the mask definition and returns the mask reference to be used in a mask attribute. It returns an empty string when no mask is pending.
+func (r *SVG) writeMask() string {
+	mask := r.pendingMask
+	if mask == nil {
+		return ""
+	}
+	r.pendingMask = nil
+
+	ref := fmt.Sprintf("m%v", r.maskID)
+	r.maskID++
+
+	sb := strings.Builder{}
+	fmt.Fprintf(&sb, `<mask id="%s" maskUnits="userSpaceOnUse" x="%v" y="%v" width="%v" height="%v"`, ref, dec(mask.Rect.X0), dec(r.height-mask.Rect.Y1), dec(mask.Rect.W()), dec(mask.Rect.H()))
+	if !mask.Luminance {
+		fmt.Fprintf(&sb, ` style="mask-type:alpha"`)
+	}
+	fmt.Fprintf(&sb, `>`)
+	if mask.Canvas != nil {
+		// render the mask content with a sub-renderer that shares the font and defs tables
+		sub := &SVG{
+			w:          &sb,
+			width:      r.width,
+			height:     r.height,
+			fonts:      r.fonts,
+			fontSubset: r.fontSubset,
+			maskID:     r.maskID,
+			defs:       r.defs,
+			opts:       r.opts,
+		}
+		mask.Canvas.RenderViewTo(sub, canvas.Identity)
+		r.maskID = sub.maskID
+	}
+	fmt.Fprintf(&sb, `</mask>`)
+	r.defs[[2]any{"mask", ref}] = [2]string{ref, sb.String()}
+	return ref
+}
+
 // SetCustomStyle defines a custom CSS code to add in the SVG
 func (r *SVG) SetCustomStyle(style string) {
 	r.customStyle = style
@@ -174,6 +217,7 @@ func (r *SVG) Size() (float64, float64) {
 
 // RenderPath renders a path to the canvas using a style and a transformation matrix.
 func (r *SVG) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix) {
+	maskRef := r.writeMask()
 	fillPaint, fillOpacity := r.writePaint(style.Fill, m)
 	strokePaint, strokeOpacity := r.writePaint(style.Stroke, m)
 
@@ -278,6 +322,9 @@ func (r *SVG) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix)
 		}
 	}
 	r.writeClasses(r.w)
+	if maskRef != "" {
+		fmt.Fprintf(r.w, `" mask="url(#%s)`, maskRef)
+	}
 	fmt.Fprintf(r.w, `"/>`)
 
 	if style.HasStroke() && strokeUnsupported {
@@ -298,6 +345,9 @@ func (r *SVG) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix)
 			fmt.Fprintf(r.w, `" fill-rule="evenodd`)
 		}
 		r.writeClasses(r.w)
+		if maskRef != "" {
+			fmt.Fprintf(r.w, `" mask="url(#%s)`, maskRef)
+		}
 		fmt.Fprintf(r.w, `"/>`)
 	}
 }
@@ -389,6 +439,7 @@ func (r *SVG) RenderText(text *canvas.Text, m canvas.Matrix) {
 	if text.Empty() {
 		return
 	}
+	maskRef := r.writeMask()
 
 	text.RenderDecorationsTo(r, m, 0.0)
 
@@ -438,6 +489,9 @@ func (r *SVG) RenderText(text *canvas.Text, m canvas.Matrix) {
 		}
 	}
 	r.writeClasses(r.w)
+	if maskRef != "" {
+		fmt.Fprintf(r.w, `" mask="url(#%s)`, maskRef)
+	}
 	fmt.Fprintf(r.w, `">`)
 
 	text.WalkSpans(func(x, y float64, span canvas.TextSpan) {
@@ -472,8 +526,13 @@ func (r *SVG) RenderText(text *canvas.Text, m canvas.Matrix) {
 
 // RenderImage renders an image to the canvas using a transformation matrix.
 func (r *SVG) RenderImage(img image.Image, m canvas.Matrix) {
+	maskRef := r.writeMask()
 	size := img.Bounds().Size()
 	writeTo, refMask, mimetype := r.encodableImage(img)
+	if maskRef != "" {
+		// the canvas mask takes precedence over the image's own opacity mask
+		refMask = maskRef
+	}
 
 	m = m.Translate(0.0, float64(size.Y))
 	fmt.Fprintf(r.w, `<image transform="%s" width="%d" height="%d" xlink:href="data:%s;base64,`,

@@ -711,14 +711,17 @@ type layer struct {
 	text *Text
 	img  image.Image
 
-	m     Matrix
-	style Style // only for path
+	m      Matrix
+	style  Style // only for path
+	mask   *Mask
+	hidden bool
 }
 
 // Canvas stores all drawing operations as layers that can be re-rendered to other renderers.
 type Canvas struct {
 	layers map[int][]layer
 	zindex int
+	mask   *Mask
 	W, H   float64
 }
 
@@ -747,7 +750,7 @@ func (c *Canvas) RenderPath(path *Path, style Style, m Matrix) {
 		c.layers = map[int][]layer{}
 	}
 	path = path.Copy()
-	c.layers[c.zindex] = append(c.layers[c.zindex], layer{path: path, m: m, style: style})
+	c.layers[c.zindex] = append(c.layers[c.zindex], layer{path: path, m: m, style: style, mask: c.mask})
 }
 
 // RenderText renders a text object to the canvas using a transformation matrix.
@@ -755,7 +758,7 @@ func (c *Canvas) RenderText(text *Text, m Matrix) {
 	if c.layers == nil {
 		c.layers = map[int][]layer{}
 	}
-	c.layers[c.zindex] = append(c.layers[c.zindex], layer{text: text, m: m})
+	c.layers[c.zindex] = append(c.layers[c.zindex], layer{text: text, m: m, mask: c.mask})
 }
 
 // RenderImage renders an image to the canvas using a transformation matrix.
@@ -763,7 +766,7 @@ func (c *Canvas) RenderImage(img image.Image, m Matrix) {
 	if c.layers == nil {
 		c.layers = map[int][]layer{}
 	}
-	c.layers[c.zindex] = append(c.layers[c.zindex], layer{img: img, m: m})
+	c.layers[c.zindex] = append(c.layers[c.zindex], layer{img: img, m: m, mask: c.mask})
 }
 
 // Empty return true if the canvas is empty.
@@ -781,11 +784,17 @@ func (c *Canvas) SetZIndex(zindex int) {
 	c.zindex = zindex
 }
 
+// SetMask sets the mask to be attached to subsequently rendered layers. A nil mask clears the current mask. It implements the MaskRenderer interface so that masks are preserved when rendering a canvas into another canvas.
+func (c *Canvas) SetMask(mask *Mask) {
+	c.mask = mask
+}
+
 // Transform transforms the canvas.
 func (c *Canvas) Transform(m Matrix) {
 	for _, layers := range c.layers {
 		for i, l := range layers {
 			layers[i].m = m.Mul(l.m)
+			layers[i].mask = l.mask.Transform(m)
 		}
 	}
 }
@@ -804,6 +813,9 @@ func (c *Canvas) Bounds() Rect {
 	// TODO: translate gradients
 	for _, layers := range c.layers {
 		for _, l := range layers {
+			if l.hidden {
+				continue
+			}
 			bounds := Rect{}
 			if l.path != nil {
 				bounds = l.path.Bounds()
@@ -858,7 +870,24 @@ func (c *Canvas) RenderViewTo(r Renderer, view Matrix) {
 
 	for _, zindex := range zindices {
 		for _, l := range c.layers[zindex] {
+			if l.hidden {
+				continue
+			}
 			m := view.Mul(l.m)
+			if l.mask != nil {
+				if mr, ok := r.(MaskRenderer); ok {
+					mr.SetMask(l.mask.Transform(view))
+					if l.path != nil {
+						r.RenderPath(l.path, l.style, m)
+					} else if l.text != nil {
+						r.RenderText(l.text, m)
+					} else if l.img != nil {
+						r.RenderImage(l.img, m)
+					}
+					mr.SetMask(nil)
+					continue
+				}
+			}
 			if l.path != nil {
 				r.RenderPath(l.path, l.style, m)
 			} else if l.text != nil {
