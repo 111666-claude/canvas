@@ -13,6 +13,8 @@ import (
 	"image/png"
 	"io"
 	"math"
+	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/tdewolff/canvas"
@@ -26,6 +28,10 @@ type Options struct {
 	EmbedFonts  bool
 	SubsetFonts bool
 	SizeUnits   string
+	// Dedup enables the resource registry: gradients, patterns, clip paths, masks and embedded images are deduplicated by content and color space, emitted once in a single defs element with document-stable IDs, and referenced through href and style attributes. When disabled, the renderer produces the legacy output.
+	Dedup bool
+	// MaxResourceSize bounds the size in bytes of a single resource definition when Dedup is enabled. Values <= 0 select a default of 64 MiB.
+	MaxResourceSize int
 	cimage.ImageEncoding
 }
 
@@ -33,20 +39,28 @@ var DefaultOptions = Options{
 	EmbedFonts:    true,
 	SubsetFonts:   false, // TODO: enable when properly handling GPOS and GSUB tables
 	SizeUnits:     "mm",
+	Dedup:         true,
 	ImageEncoding: cimage.Lossless,
 }
 
 // SVG is a scalable vector graphics renderer.
 type SVG struct {
-	w             io.Writer
+	w             io.Writer // render target: out directly, or bodyBuf when deduplicating
+	out           io.Writer // final output
+	bodyBuf       bytes.Buffer
+	tw            *trackedWriter
+	gz            *gzip.Writer
 	width, height float64
 	fonts         map[*canvas.Font]bool
 	fontSubset    map[*canvas.Font]*canvas.FontSubsetter
 	maskID        int
 	defs          map[any][2]string
+	registry      *resourceRegistry
 	classes       []string
 	customStyle   string
 	opts          *Options
+	closed        bool
+	err           error
 }
 
 // New returns a scalable vector graphics (SVG) renderer.
@@ -56,16 +70,22 @@ func New(w io.Writer, width, height float64, opts *Options) *SVG {
 		opts = &defaultOptions
 	}
 
+	var gz *gzip.Writer
 	if opts.Compression != 0 {
 		if opts.Compression < gzip.HuffmanOnly || gzip.BestCompression < opts.Compression {
 			opts.Compression = -1
 		}
-		w, _ = gzip.NewWriterLevel(w, opts.Compression)
+		gz, _ = gzip.NewWriterLevel(w, opts.Compression)
+		w = gz
 	}
 
-	fmt.Fprintf(w, `<svg version="1.1" width="%v%s" height="%v%s" viewBox="0 0 %v %v" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">`, dec(width), opts.SizeUnits, dec(height), opts.SizeUnits, dec(width), dec(height))
-	return &SVG{
-		w:          w,
+	tw := &trackedWriter{w: w}
+	fmt.Fprintf(tw, `<svg version="1.1" width="%v%s" height="%v%s" viewBox="0 0 %v %v" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">`, dec(width), opts.SizeUnits, dec(height), opts.SizeUnits, dec(width), dec(height))
+	r := &SVG{
+		w:          tw,
+		out:        tw,
+		tw:         tw,
+		gz:         gz,
 		width:      width,
 		height:     height,
 		fonts:      map[*canvas.Font]bool{},
@@ -73,19 +93,36 @@ func New(w io.Writer, width, height float64, opts *Options) *SVG {
 		defs:       map[any][2]string{},
 		opts:       opts,
 	}
+	if opts.Dedup {
+		r.registry = newResourceRegistry("srgb", opts.MaxResourceSize)
+		// buffer the document body so that the deduplicated resources can be
+		// emitted in a defs element before the elements that reference them
+		r.w = &r.bodyBuf
+	}
+	return r
 }
 
-// Close finished and closes the SVG.
+// Close finished and closes the SVG. It returns the first error encountered while rendering or writing, including resource registry errors (ID conflicts, circular references, oversized resources) and short writes to the underlying writer. Closing an already closed renderer returns an ErrClosed error and leaves the document untouched.
 func (r *SVG) Close() error {
-	if 0 < len(r.defs) {
+	if r.closed {
+		return fmt.Errorf("svg: %w", ErrClosed)
+	}
+	r.closed = true
+
+	if r.registry != nil {
+		r.setErr(r.registry.writeTo(r.out))
+		if _, err := r.bodyBuf.WriteTo(r.out); err != nil {
+			r.setErr(fmt.Errorf("svg: writing SVG: %w", err))
+		}
+	} else if 0 < len(r.defs) {
 		for _, v := range r.defs {
-			fmt.Fprintf(r.w, "<defs>%s</defs>", v[1])
+			fmt.Fprintf(r.out, "<defs>%s</defs>", v[1])
 		}
 	}
 	if r.customStyle != "" || r.opts.EmbedFonts && 0 < len(r.fonts) {
-		fmt.Fprintf(r.w, "<style>")
+		fmt.Fprintf(r.out, "<style>")
 		if r.customStyle != "" {
-			fmt.Fprintf(r.w, "%s\n", html.EscapeString(r.customStyle))
+			fmt.Fprintf(r.out, "%s\n", html.EscapeString(r.customStyle))
 		}
 		if r.opts.EmbedFonts && 0 < len(r.fonts) {
 			for f := range r.fonts {
@@ -100,27 +137,41 @@ func (r *SVG) Close() error {
 				}
 				fontProgram := sfnt.Write()
 
-				fmt.Fprintf(r.w, "\n@font-face{font-family:'%s'", f.Name())
+				fmt.Fprintf(r.out, "\n@font-face{font-family:'%s'", f.Name())
 				if f.Style().Weight() != canvas.FontRegular {
-					fmt.Fprintf(r.w, ";font-weight:%d", f.Style().CSS())
+					fmt.Fprintf(r.out, ";font-weight:%d", f.Style().CSS())
 				}
 				if f.Style().Italic() {
-					fmt.Fprintf(r.w, ";font-style:italic")
+					fmt.Fprintf(r.out, ";font-style:italic")
 				}
-				fmt.Fprintf(r.w, ";src:url('data:type/opentype;base64,")
-				encoder := base64.NewEncoder(base64.StdEncoding, r.w)
+				fmt.Fprintf(r.out, ";src:url('data:type/opentype;base64,")
+				encoder := base64.NewEncoder(base64.StdEncoding, r.out)
 				encoder.Write(fontProgram)
 				encoder.Close()
-				fmt.Fprintf(r.w, "');}")
+				fmt.Fprintf(r.out, "');}")
 			}
 		}
-		fmt.Fprintf(r.w, "\n</style>")
+		fmt.Fprintf(r.out, "\n</style>")
 	}
-	_, err := fmt.Fprintf(r.w, "</svg>")
-	if r.opts.Compression != 0 {
-		r.w.(*gzip.Writer).Close() // does not close underlying writer
+	_, err := fmt.Fprintf(r.out, "</svg>")
+	r.setErr(err)
+	if r.gz != nil {
+		r.setErr(r.gz.Close()) // does not close underlying writer
 	}
-	return err
+	if r.err != nil {
+		return r.err
+	}
+	if r.tw.err != nil {
+		return fmt.Errorf("svg: writing SVG: %w", r.tw.err)
+	}
+	return nil
+}
+
+// setErr records the first error encountered while rendering. Render methods cannot return errors, so the error is reported by Close.
+func (r *SVG) setErr(err error) {
+	if r.err == nil && err != nil {
+		r.err = err
+	}
 }
 
 func (r *SVG) writeClasses(w io.Writer) {
@@ -174,6 +225,9 @@ func (r *SVG) Size() (float64, float64) {
 
 // RenderPath renders a path to the canvas using a style and a transformation matrix.
 func (r *SVG) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix) {
+	if r.closed {
+		return
+	}
 	fillPaint := r.writePaint(style.Fill, m)
 	strokePaint := r.writePaint(style.Stroke, m)
 
@@ -365,7 +419,7 @@ func (r *SVG) writeFontStyle(face, faceMain *canvas.FontFace, rtl bool, fill str
 
 // RenderText renders a text object to the canvas using a transformation matrix.
 func (r *SVG) RenderText(text *canvas.Text, m canvas.Matrix) {
-	if text.Empty() {
+	if r.closed || text.Empty() {
 		return
 	}
 
@@ -450,6 +504,14 @@ func (r *SVG) RenderText(text *canvas.Text, m canvas.Matrix) {
 
 // RenderImage renders an image to the canvas using a transformation matrix.
 func (r *SVG) RenderImage(img image.Image, m canvas.Matrix) {
+	if r.closed {
+		return
+	}
+	if r.registry != nil {
+		r.renderImageRegistered(img, m)
+		return
+	}
+
 	size := img.Bounds().Size()
 	writeTo, refMask, mimetype := r.encodableImage(img)
 
@@ -458,12 +520,13 @@ func (r *SVG) RenderImage(img image.Image, m canvas.Matrix) {
 		m.ToSVG(r.height), size.X, size.Y, mimetype)
 
 	encoder := base64.NewEncoder(base64.StdEncoding, r.w)
-	err := writeTo(encoder)
-	if err != nil {
-		panic(err)
+	if err := writeTo(encoder); err != nil {
+		r.setErr(fmt.Errorf("svg: encoding image: %w", err))
+		return
 	}
 	if err := encoder.Close(); err != nil {
-		panic(err)
+		r.setErr(fmt.Errorf("svg: encoding image: %w", err))
+		return
 	}
 
 	if refMask != "" {
@@ -471,6 +534,79 @@ func (r *SVG) RenderImage(img image.Image, m canvas.Matrix) {
 	}
 	r.writeClasses(r.w)
 	fmt.Fprintf(r.w, `"/>`)
+}
+
+// renderImageRegistered renders an image through the resource registry: the image payload (and its opacity mask, if any) is registered once and emitted in the defs element, while the image itself is drawn as a use element referencing the shared definition. Identical images thus share a single embedded copy.
+func (r *SVG) renderImageRegistered(img image.Image, m canvas.Matrix) {
+	size := img.Bounds().Size()
+	writeTo, mask, mimetype := r.encodableImageRegistered(img)
+
+	payload := &bytes.Buffer{}
+	encoder := base64.NewEncoder(base64.StdEncoding, payload)
+	if err := writeTo(encoder); err != nil {
+		r.setErr(fmt.Errorf("svg: encoding image: %w", err))
+		return
+	}
+	if err := encoder.Close(); err != nil {
+		r.setErr(fmt.Errorf("svg: encoding image: %w", err))
+		return
+	}
+
+	var refs []string
+	maskRef := ""
+	if mask != nil {
+		maskPayload := &bytes.Buffer{}
+		maskEncoder := base64.NewEncoder(base64.StdEncoding, maskPayload)
+		if err := jpeg.Encode(maskEncoder, mask, nil); err != nil {
+			r.setErr(fmt.Errorf("svg: encoding image opacity mask: %w", err))
+			return
+		}
+		if err := maskEncoder.Close(); err != nil {
+			r.setErr(fmt.Errorf("svg: encoding image opacity mask: %w", err))
+			return
+		}
+
+		content := appendSize(nil, size)
+		content = append(content, maskPayload.Bytes()...)
+		id, err := r.registry.register(MaskResource, content, nil, func(id string) []byte {
+			return []byte(fmt.Sprintf(`<mask id="%s"><image width="%d" height="%d" xlink:href="data:image/jpeg;base64,%s"/></mask>`, id, size.X, size.Y, maskPayload.Bytes()))
+		})
+		if err != nil {
+			r.setErr(err)
+			return
+		}
+		maskRef = id
+		refs = append(refs, id)
+	}
+
+	content := append([]byte(mimetype), 0x00)
+	content = append(content, payload.Bytes()...)
+	content = append(content, 0x00)
+	content = append(content, maskRef...)
+	id, err := r.registry.register(ImageResource, content, refs, func(id string) []byte {
+		sb := strings.Builder{}
+		fmt.Fprintf(&sb, `<image id="%s" width="%d" height="%d" xlink:href="data:%s;base64,%s"`, id, size.X, size.Y, mimetype, payload.Bytes())
+		if maskRef != "" {
+			fmt.Fprintf(&sb, ` mask="url(#%s)"`, maskRef)
+		}
+		fmt.Fprintf(&sb, `/>`)
+		return []byte(sb.String())
+	})
+	if err != nil {
+		r.setErr(err)
+		return
+	}
+
+	m = m.Translate(0.0, float64(size.Y))
+	fmt.Fprintf(r.w, `<use xlink:href="#%s" transform="%s`, id, m.ToSVG(r.height))
+	r.writeClasses(r.w)
+	fmt.Fprintf(r.w, `"/>`)
+}
+
+func appendSize(b []byte, size image.Point) []byte {
+	b = strconv.AppendInt(b, int64(size.X), 10)
+	b = append(b, 'x')
+	return strconv.AppendInt(b, int64(size.Y), 10)
 }
 
 // return a WriterTo, a refMask and a mimetype
@@ -508,6 +644,41 @@ func (r *SVG) encodableImage(img image.Image) (func(io.Writer) error, string, st
 	}, "", "image/png"
 }
 
+// encodableImageRegistered is like encodableImage, but returns the opacity mask as an image instead of writing it to the document, so that the mask can be registered as a resource.
+func (r *SVG) encodableImageRegistered(img image.Image) (func(io.Writer) error, image.Image, string) {
+	// lossy: jpeg
+	if r.opts.ImageEncoding == cimage.Lossy {
+		if cimg, ok := img.(*cimage.Image); ok && cimg.Mimetype == "image/jpeg" {
+			return func(w io.Writer) error {
+				_, err := w.Write(cimg.Bytes)
+				return err
+			}, nil, cimg.Mimetype
+		} else if ok {
+			img, _ = cimg.Image() // allow optimisation in jpeg.Encode
+		}
+
+		var mask image.Image
+		if opaqueImg, ok := img.(interface{ Opaque() bool }); !ok || !opaqueImg.Opaque() {
+			img, mask = splitImageAlphaChannel(img)
+		}
+		return func(w io.Writer) error {
+			return jpeg.Encode(w, img, nil)
+		}, mask, "image/jpeg"
+	}
+
+	// any other
+	if cimg, ok := img.(*cimage.Image); ok {
+		return func(w io.Writer) error {
+			_, err := w.Write(cimg.Bytes)
+			return err
+		}, nil, cimg.Mimetype
+	}
+
+	return func(w io.Writer) error {
+		return png.Encode(w, img)
+	}, nil, "image/png"
+}
+
 func (r *SVG) renderOpacityMask(img image.Image) (image.Image, string) {
 	opaque, mask := splitImageAlphaChannel(img)
 	if mask == nil {
@@ -522,10 +693,12 @@ func (r *SVG) renderOpacityMask(img image.Image) (image.Image, string) {
 
 	encoder := base64.NewEncoder(base64.StdEncoding, r.w)
 	if err := jpeg.Encode(encoder, mask, nil); err != nil {
-		panic(err)
+		r.setErr(fmt.Errorf("svg: encoding image opacity mask: %w", err))
+		return opaque, ""
 	}
 	if err := encoder.Close(); err != nil {
-		panic(err)
+		r.setErr(fmt.Errorf("svg: encoding image opacity mask: %w", err))
+		return opaque, ""
 	}
 	fmt.Fprintf(r.w, `"/></mask>`)
 	return opaque, refMask
@@ -563,49 +736,110 @@ func (r *SVG) writePaint(paint canvas.Paint, m canvas.Matrix) string {
 		// TODO
 		return ""
 	} else if paint.IsGradient() {
+		if r.registry != nil {
+			id, err := r.registry.register(GradientResource, gradientContent(paint.Gradient, m), nil, func(id string) []byte {
+				return []byte(r.gradientDef(id, paint.Gradient, m))
+			})
+			if err != nil {
+				r.setErr(err)
+				return ""
+			}
+			return fmt.Sprintf("url(#%v)", id)
+		}
+
 		var def string
 		ref := fmt.Sprintf("d%v", len(r.defs))
 		if v, ok := r.defs[[2]any{paint.Gradient, m}]; ok {
 			return fmt.Sprintf("url(#%v)", v[0])
-		} else if linearGradient, ok := paint.Gradient.(*canvas.LinearGradient); ok {
-			sb := strings.Builder{}
-			if m.IsSimilarity() {
-				start := m.Dot(linearGradient.Start)
-				end := m.Dot(linearGradient.End)
-				fmt.Fprintf(&sb, `<linearGradient id="%v" gradientUnits="userSpaceOnUse" x1="%v" y1="%v" x2="%v" y2="%v">`, ref, dec(start.X), dec(r.height-start.Y), dec(end.X), dec(r.height-end.Y))
-			} else {
-				// negate the Y coordinates because ToSVG(r.height) applies Y-axis reflection in its translation component,
-				// so negating the gradient coordinates cancels out the double Y-axis reflection to achieve correct positioning.
-				fmt.Fprintf(&sb, `<linearGradient id="%v" gradientUnits="userSpaceOnUse" gradientTransform="%v" x1="%v" y1="%v" x2="%v" y2="%v">`, ref, m.ToSVG(r.height), dec(linearGradient.Start.X), -dec(linearGradient.Start.Y), dec(linearGradient.End.X), -dec(linearGradient.End.Y))
-			}
-			for _, stop := range linearGradient.Grad {
-				fmt.Fprintf(&sb, `<stop offset="%v" stop-color="%v"/>`, dec(stop.Offset), canvas.CSSColor(stop.Color))
-			}
-			fmt.Fprintf(&sb, `</linearGradient>`)
-			def = sb.String()
-		} else if radialGradient, ok := paint.Gradient.(*canvas.RadialGradient); ok {
-			sb := strings.Builder{}
-			if m.IsSimilarity() {
-				c0 := m.Dot(radialGradient.C0)
-				c1 := m.Dot(radialGradient.C1)
-				scale := math.Sqrt(math.Abs(m.Det()))
-				r0 := scale * radialGradient.R0
-				r1 := scale * radialGradient.R1
-				fmt.Fprintf(&sb, `<radialGradient id="%v" gradientUnits="userSpaceOnUse" fx="%v" fy="%v" fr="%v" cx="%v" cy="%v" r="%v">`, ref, dec(c0.X), dec(r.height-c0.Y), dec(r0), dec(c1.X), dec(r.height-c1.Y), dec(r1))
-			} else {
-				// negate the Y coordinates because ToSVG(r.height) applies Y-axis reflection in its translation component,
-				// so negating the gradient coordinates cancels out the double Y-axis reflection to achieve correct positioning.
-				fmt.Fprintf(&sb, `<radialGradient id="%v" gradientUnits="userSpaceOnUse" gradientTransform="%v" fx="%v" fy="%v" fr="%v" cx="%v" cy="%v" r="%v">`, ref, m.ToSVG(r.height), dec(radialGradient.C0.X), -dec(radialGradient.C0.Y), dec(radialGradient.R0), dec(radialGradient.C1.X), -dec(radialGradient.C1.Y), dec(radialGradient.R1))
-			}
-			for _, stop := range radialGradient.Grad {
-				fmt.Fprintf(&sb, `<stop offset="%v" stop-color="%v"/>`, dec(stop.Offset), canvas.CSSColor(stop.Color))
-			}
-			fmt.Fprintf(&sb, `</radialGradient>`)
-			def = sb.String()
 		}
+		def = r.gradientDef(ref, paint.Gradient, m)
 		r.defs[[2]any{paint.Gradient, m}] = [2]string{ref, def}
 		return fmt.Sprintf("url(#%v)", ref)
 	} else {
 		return fmt.Sprintf("%v", canvas.CSSColor(paint.Color))
 	}
+}
+
+// gradientDef returns the SVG definition of a gradient transformed by m, with the given ID.
+func (r *SVG) gradientDef(ref string, gradient canvas.Gradient, m canvas.Matrix) string {
+	if linearGradient, ok := gradient.(*canvas.LinearGradient); ok {
+		sb := strings.Builder{}
+		if m.IsSimilarity() {
+			start := m.Dot(linearGradient.Start)
+			end := m.Dot(linearGradient.End)
+			fmt.Fprintf(&sb, `<linearGradient id="%v" gradientUnits="userSpaceOnUse" x1="%v" y1="%v" x2="%v" y2="%v">`, ref, dec(start.X), dec(r.height-start.Y), dec(end.X), dec(r.height-end.Y))
+		} else {
+			// negate the Y coordinates because ToSVG(r.height) applies Y-axis reflection in its translation component,
+			// so negating the gradient coordinates cancels out the double Y-axis reflection to achieve correct positioning.
+			fmt.Fprintf(&sb, `<linearGradient id="%v" gradientUnits="userSpaceOnUse" gradientTransform="%v" x1="%v" y1="%v" x2="%v" y2="%v">`, ref, m.ToSVG(r.height), dec(linearGradient.Start.X), -dec(linearGradient.Start.Y), dec(linearGradient.End.X), -dec(linearGradient.End.Y))
+		}
+		for _, stop := range linearGradient.Grad {
+			fmt.Fprintf(&sb, `<stop offset="%v" stop-color="%v"/>`, dec(stop.Offset), canvas.CSSColor(stop.Color))
+		}
+		fmt.Fprintf(&sb, `</linearGradient>`)
+		return sb.String()
+	} else if radialGradient, ok := gradient.(*canvas.RadialGradient); ok {
+		sb := strings.Builder{}
+		if m.IsSimilarity() {
+			c0 := m.Dot(radialGradient.C0)
+			c1 := m.Dot(radialGradient.C1)
+			scale := math.Sqrt(math.Abs(m.Det()))
+			r0 := scale * radialGradient.R0
+			r1 := scale * radialGradient.R1
+			fmt.Fprintf(&sb, `<radialGradient id="%v" gradientUnits="userSpaceOnUse" fx="%v" fy="%v" fr="%v" cx="%v" cy="%v" r="%v">`, ref, dec(c0.X), dec(r.height-c0.Y), dec(r0), dec(c1.X), dec(r.height-c1.Y), dec(r1))
+		} else {
+			// negate the Y coordinates because ToSVG(r.height) applies Y-axis reflection in its translation component,
+			// so negating the gradient coordinates cancels out the double Y-axis reflection to achieve correct positioning.
+			fmt.Fprintf(&sb, `<radialGradient id="%v" gradientUnits="userSpaceOnUse" gradientTransform="%v" fx="%v" fy="%v" fr="%v" cx="%v" cy="%v" r="%v">`, ref, m.ToSVG(r.height), dec(radialGradient.C0.X), -dec(radialGradient.C0.Y), dec(radialGradient.R0), dec(radialGradient.C1.X), -dec(radialGradient.C1.Y), dec(radialGradient.R1))
+		}
+		for _, stop := range radialGradient.Grad {
+			fmt.Fprintf(&sb, `<stop offset="%v" stop-color="%v"/>`, dec(stop.Offset), canvas.CSSColor(stop.Color))
+		}
+		fmt.Fprintf(&sb, `</radialGradient>`)
+		return sb.String()
+	}
+	return ""
+}
+
+// gradientContent returns a canonical serialization of a gradient and its transformation matrix, used as the deduplication key by the resource registry. Gradients with identical stops, geometry and transformation share a key, even if they are distinct objects.
+func gradientContent(gradient canvas.Gradient, m canvas.Matrix) []byte {
+	buf := make([]byte, 0, 128)
+	for _, row := range m {
+		for _, v := range row {
+			buf = strconv.AppendFloat(buf, v, 'g', -1, 64)
+			buf = append(buf, ',')
+		}
+	}
+	appendStops := func(grad canvas.Grad) {
+		for _, stop := range grad {
+			buf = strconv.AppendFloat(buf, stop.Offset, 'g', -1, 64)
+			buf = append(buf, ',')
+			buf = append(buf, stop.Color.R, stop.Color.G, stop.Color.B, stop.Color.A)
+		}
+	}
+	switch gradient := gradient.(type) {
+	case *canvas.LinearGradient:
+		buf = append(buf, 'L')
+		for _, v := range []float64{gradient.Start.X, gradient.Start.Y, gradient.End.X, gradient.End.Y} {
+			buf = strconv.AppendFloat(buf, v, 'g', -1, 64)
+			buf = append(buf, ',')
+		}
+		appendStops(gradient.Grad)
+	case *canvas.RadialGradient:
+		buf = append(buf, 'R')
+		for _, v := range []float64{gradient.C0.X, gradient.C0.Y, gradient.C1.X, gradient.C1.Y, gradient.R0, gradient.R1} {
+			buf = strconv.AppendFloat(buf, v, 'g', -1, 64)
+			buf = append(buf, ',')
+		}
+		appendStops(gradient.Grad)
+	default:
+		// unknown gradient type: never merge distinct instances
+		buf = append(buf, fmt.Sprintf("%T", gradient)...)
+		if v := reflect.ValueOf(gradient); v.Kind() == reflect.Ptr {
+			buf = append(buf, fmt.Sprintf("@%x", v.Pointer())...)
+		} else {
+			buf = append(buf, fmt.Sprintf("%#v", gradient)...)
+		}
+	}
+	return buf
 }
