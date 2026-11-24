@@ -67,7 +67,21 @@ type svgParser struct {
 
 	// active definitions for attributes
 	activeDefs map[string]svgDef
+
+	// element trees by ID for <use> instantiation
+	elems    map[string]*svgTag
+	useStack []string // ID chain of the <use> references being instantiated
+	useCount int      // total number of instantiated <use> references
 }
+
+// svgMaxUseDepth bounds the nesting depth of <use> instantiation, and
+// svgMaxUseInstances bounds the total number of <use> instantiations per
+// document. Both guard against pathological documents (exponential expansion
+// or extremely deep nesting) by degrading gracefully instead of hanging.
+const (
+	svgMaxUseDepth     = 64
+	svgMaxUseInstances = 4096
+)
 
 func (svg *svgParser) parseViewBox(attrWidth, attrHeight, attrViewBox string) (float64, float64, [4]float64) {
 	var err error
@@ -383,6 +397,7 @@ type svgTag struct {
 	attrNames []string
 	attrs     map[string]string
 	content   []*svgTag
+	text      string
 }
 
 func (svg *svgParser) parseTag(l *xml.Lexer) *svgTag {
@@ -434,6 +449,10 @@ func (svg *svgParser) parseTag(l *xml.Lexer) *svgTag {
 				}
 				break
 			}
+		} else if tt == xml.TextToken {
+			if parent != nil {
+				parent.text += string(data)
+			}
 		} else if tt == xml.EndTagToken {
 			if parent == nil {
 				break // when starting on an end tag
@@ -457,6 +476,7 @@ func (svg *svgParser) parseDefs(l *xml.Lexer) {
 		if id == "" {
 			continue
 		}
+		svg.registerTree(tag)
 		switch tag.name {
 		case "linearGradient":
 			if _, ok := tag.attrs["x2"]; !ok {
@@ -767,6 +787,253 @@ func (svg *svgParser) parseDefs(l *xml.Lexer) {
 			}
 		}
 	}
+}
+
+// registerTree registers an element tree parsed from <defs> or <symbol> by ID
+// so that it can be instantiated by <use>. The tree is only stored and never
+// modified. The first element with a given ID wins, duplicate IDs are an
+// error.
+func (svg *svgParser) registerTree(tag *svgTag) {
+	if id := tag.attrs["id"]; id != "" {
+		if _, ok := svg.elems[id]; ok {
+			if svg.err == nil {
+				svg.err = parse.NewErrorLexer(svg.z, "duplicate ID: %s", id)
+			}
+		} else {
+			svg.elems[id] = tag
+		}
+	}
+	for _, child := range tag.content {
+		svg.registerTree(child)
+	}
+}
+
+// useChain returns the chain of <use> references being instantiated, appended
+// by the given ID, for error reporting.
+func (svg *svgParser) useChain(id string) string {
+	chain := make([]string, 0, len(svg.useStack)+1)
+	chain = append(chain, svg.useStack...)
+	if id != "" {
+		chain = append(chain, id)
+	}
+	return strings.Join(chain, " -> ")
+}
+
+// parsePreserveAspectRatio parses a preserveAspectRatio attribute value and
+// returns the alignment and whether to meet (true) or slice (false). Invalid
+// values degrade to the default of "xMidYMid meet".
+func parsePreserveAspectRatio(val string) (string, bool) {
+	align := "xMidYMid"
+	meet := true
+	for _, field := range strings.Fields(val) {
+		switch field {
+		case "defer":
+		case "meet":
+			meet = true
+		case "slice":
+			meet = false
+		case "none", "xMinYMin", "xMinYMid", "xMinYMax", "xMidYMin", "xMidYMid", "xMidYMax", "xMaxYMin", "xMaxYMid", "xMaxYMax":
+			align = field
+		}
+	}
+	return align, meet
+}
+
+// viewBoxTransform returns the transformation that maps the viewBox to a
+// viewport of w by h, honoring preserveAspectRatio. The second return value
+// is false when rendering is disabled (a zero-sized viewBox) or when the
+// viewBox is invalid.
+func (svg *svgParser) viewBoxTransform(attrViewBox, attrPAR string, w, h float64) (Matrix, bool) {
+	if attrViewBox == "" {
+		return Identity, true
+	}
+	vals := svg.parsePoints(attrViewBox)
+	if len(vals) != 4 {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "bad viewBox: %s", attrViewBox)
+		}
+		return Identity, false
+	} else if vals[2] < 0.0 || vals[3] < 0.0 {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "bad viewBox: negative size: %s", attrViewBox)
+		}
+		return Identity, false
+	} else if vals[2] == 0.0 || vals[3] == 0.0 {
+		return Identity, false // disables rendering
+	}
+
+	align, meet := parsePreserveAspectRatio(attrPAR)
+	sx, sy := w/vals[2], h/vals[3]
+	if align == "none" {
+		return Identity.Scale(sx, sy).Translate(-vals[0], -vals[1]), true
+	}
+	s := math.Min(sx, sy)
+	if !meet {
+		s = math.Max(sx, sy)
+	}
+	var tx, ty float64
+	switch align[1:4] {
+	case "Mid":
+		tx = (w - vals[2]*s) / 2.0
+	case "Max":
+		tx = w - vals[2]*s
+	}
+	switch align[5:8] {
+	case "Mid":
+		ty = (h - vals[3]*s) / 2.0
+	case "Max":
+		ty = h - vals[3]*s
+	}
+	return Identity.Translate(tx, ty).Scale(s, s).Translate(-vals[0], -vals[1]), true
+}
+
+// renderUse instantiates the element referenced by a <use> element into the
+// current coordinate system. The <use> element itself must already have been
+// pushed and styled by the caller. Errors degrade gracefully: the instance is
+// skipped, parsing continues, and an error with the reference chain is
+// reported.
+func (svg *svgParser) renderUse(attrs map[string]string) {
+	href := strings.TrimSpace(attrs["href"])
+	if href == "" {
+		href = strings.TrimSpace(attrs["xlink:href"])
+	}
+	if href == "" {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "use: missing href attribute (chain: %s)", svg.useChain(""))
+		}
+		return
+	}
+	if !strings.HasPrefix(href, "#") {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "use: external reference not supported: %s (chain: %s)", href, svg.useChain(""))
+		}
+		return
+	}
+	id := href[1:]
+	if id == "" {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "use: empty reference (chain: %s)", svg.useChain(""))
+		}
+		return
+	}
+	for _, ref := range svg.useStack {
+		if ref == id {
+			if svg.err == nil {
+				svg.err = parse.NewErrorLexer(svg.z, "use: circular reference: %s", svg.useChain(id))
+			}
+			return
+		}
+	}
+	if svgMaxUseDepth <= len(svg.useStack) {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "use: maximum instantiation depth of %d exceeded (chain: %s)", svgMaxUseDepth, svg.useChain(id))
+		}
+		return
+	}
+	if svgMaxUseInstances <= svg.useCount {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "use: maximum instantiation count of %d exceeded (chain: %s)", svgMaxUseInstances, svg.useChain(id))
+		}
+		return
+	}
+	tag, ok := svg.elems[id]
+	if !ok {
+		if svg.err == nil {
+			svg.err = parse.NewErrorLexer(svg.z, "use: unknown reference: #%s (chain: %s)", id, svg.useChain(id))
+		}
+		return
+	}
+	svg.useCount++
+	svg.useStack = append(svg.useStack, id)
+	defer func() {
+		svg.useStack = svg.useStack[:len(svg.useStack)-1]
+	}()
+
+	x := svg.parseDimension(attrs["x"], svg.width)
+	y := svg.parseDimension(attrs["y"], svg.height)
+	svg.ctx.ComposeView(Identity.Translate(x, y))
+
+	if tag.name == "symbol" || tag.name == "svg" {
+		// width/height define the viewport onto which the viewBox is mapped
+		width, height := svg.width, svg.height
+		if v, ok := attrs["width"]; ok {
+			width = svg.parseDimension(v, svg.width)
+		}
+		if v, ok := attrs["height"]; ok {
+			height = svg.parseDimension(v, svg.height)
+		}
+		if width < 0.0 || height < 0.0 {
+			if svg.err == nil {
+				svg.err = parse.NewErrorLexer(svg.z, "use: negative width/height (chain: %s)", svg.useChain(""))
+			}
+			return
+		} else if width == 0.0 || height == 0.0 {
+			return // not rendered
+		}
+
+		svg.push(tag.name, tag.attrs)
+		props := make([]cssProperty, 0, len(tag.attrNames))
+		for _, key := range tag.attrNames {
+			props = append(props, cssProperty{key, tag.attrs[key]})
+		}
+		svg.setStyling(props)
+		if m, ok := svg.viewBoxTransform(tag.attrs["viewBox"], tag.attrs["preserveAspectRatio"], width, height); ok {
+			svg.ctx.ComposeView(m)
+			for _, child := range tag.content {
+				svg.renderElement(child)
+			}
+		}
+		svg.pop()
+	} else {
+		svg.renderElement(tag)
+	}
+}
+
+// renderElement renders a stored element tree as if it were expanded in place
+// at the current position, preserving style inheritance and render order. The
+// tree is only read, never modified.
+func (svg *svgParser) renderElement(tag *svgTag) {
+	switch tag.name {
+	case "defs", "style", "symbol", "title", "desc", "metadata":
+		return // never rendered directly
+	}
+
+	svg.push(tag.name, tag.attrs)
+
+	props := make([]cssProperty, 0, len(tag.attrNames))
+	for _, key := range tag.attrNames {
+		props = append(props, cssProperty{key, tag.attrs[key]})
+	}
+	svg.setStyling(props)
+
+	svg.drawShape(tag.name, tag.attrs)
+
+	for attr, applyDef := range svg.activeDefs {
+		if applyDef != nil {
+			applyDef(attr, svg.c)
+		}
+		svg.activeDefs[attr] = nil
+	}
+
+	if tag.name == "text" && tag.text != "" {
+		textAlign := Left
+		if svg.state.textAnchor == "middle" {
+			textAlign = Center
+		} else if svg.state.textAnchor == "end" {
+			textAlign = Right
+		}
+		t := html.UnescapeString(tag.text)
+		text := NewTextLine(svg.getFontFace(), t, textAlign)
+		svg.ctx.DrawText(svg.state.textX, svg.state.textY, text)
+	}
+
+	if tag.name != "use" { // children of <use> are never rendered
+		for _, child := range tag.content {
+			svg.renderElement(child)
+		}
+	}
+
+	svg.pop()
 }
 
 func (svg *svgParser) parseStyle(b []byte) {
@@ -1103,6 +1370,8 @@ func (svg *svgParser) drawShape(tag string, attrs map[string]string) {
 	case "text":
 		svg.state.textX = svg.parseDimension(attrs["x"], svg.width)
 		svg.state.textY = svg.parseDimension(attrs["y"], svg.height)
+	case "use":
+		svg.renderUse(attrs)
 	}
 }
 
@@ -1116,6 +1385,7 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 		defs:       map[string]svgDef{},
 		fonts:      map[string]*FontFamily{},
 		activeDefs: map[string]svgDef{},
+		elems:      map[string]*svgTag{},
 	}
 	for {
 		tt, data := l.Next()
@@ -1164,6 +1434,20 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 				if tt != xml.StartTagCloseVoidToken {
 					svg.parseDefs(l)
 				}
+				break
+			} else if tag == "symbol" {
+				// symbols are never rendered directly, register for <use>
+				sym := &svgTag{name: tag, attrNames: attrNames, attrs: attrs}
+				if tt != xml.StartTagCloseVoidToken {
+					for {
+						child := svg.parseTag(l)
+						if child == nil {
+							break
+						}
+						sym.content = append(sym.content, child)
+					}
+				}
+				svg.registerTree(sym)
 				break
 			}
 
