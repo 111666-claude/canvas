@@ -133,12 +133,8 @@ func (r *Gio) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix)
 	}
 
 	if style.HasStroke() {
-		if style.IsDashed() {
-			dashOffset, dashes := canvas.ScaleDash(style.StrokeWidth, style.DashOffset, style.Dashes)
-			path = path.Dash(dashOffset, dashes...)
-		}
-		path = path.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance)
-		r.renderPath(path.Transform(m), style.Stroke)
+		stroke := canvas.DashedStroke(path, style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance, style.DashOffset, style.Dashes, m)
+		r.renderPath(stroke, style.Stroke)
 	}
 }
 

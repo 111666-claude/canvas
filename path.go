@@ -1834,7 +1834,29 @@ REPEAT:
 	return offset, d
 }
 
+// checkDash canonicalizes the dash array and reports whether the path should be
+// stroked at all. Results are cached on the path data fingerprint, offset and
+// dash array, since the path length computation is expensive for long curves.
 func (p *Path) checkDash(offset float64, d []float64) ([]float64, bool) {
+	if !finiteFloats(offset) || !finiteFloats(d...) {
+		return p.checkDashUncached(offset, d)
+	}
+	key := checkDashKey{
+		pathHash: fingerprintFloats(p.d),
+		pathLen:  len(p.d),
+		offset:   offset,
+		dashHash: fingerprintFloats(d),
+		dashLen:  len(d),
+	}
+	if res, ok := checkDashCache.get(key); ok {
+		return append(make([]float64, 0, len(res.dashes)), res.dashes...), res.ok
+	}
+	dashes, ok := p.checkDashUncached(offset, d)
+	checkDashCache.put(key, checkDashValue{append([]float64{}, dashes...), ok})
+	return dashes, ok
+}
+
+func (p *Path) checkDashUncached(offset float64, d []float64) ([]float64, bool) {
 	offset, d = dashCanonical(offset, d)
 	if len(d) == 0 {
 		return d, true // stroke without dashes

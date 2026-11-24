@@ -1490,7 +1490,7 @@ func (event *SweepPoint) breakupSegment(events *[]*SweepPoint, index int, x, y f
 	return l
 }
 
-func (squares toleranceSquares) breakupCrossingSegments(n int, x float64) {
+func (squares toleranceSquares) breakupCrossingSegments(n int, x float64, ps, qs Paths, op pathOp, fillRule FillRule) {
 	// find and break up all segments that cross this tolerance square
 	// note that we must move up to find all upwards-sloped segments and then move down for the
 	// downwards-sloped segments, since they may need to be broken up in other squares first
@@ -1552,7 +1552,7 @@ func (squares toleranceSquares) breakupCrossingSegments(n int, x float64) {
 					if square.Upper == nil {
 						// TODO: this happens sporadically, add to unit tests
 						w, _ := os.CreateTemp("", "canvas-testcase-*.gob")
-						gob.NewEncoder(w).Encode([]any{_ps, _qs, _op, _fillRule})
+						gob.NewEncoder(w).Encode([]any{ps, qs, op, fillRule})
 						w.Close()
 						fmt.Println("NOTE: new test case written to", w.Name())
 						square.Upper = prev
@@ -1781,10 +1781,6 @@ func (s *SweepPoint) mergeOverlapping(op pathOp, fillRule FillRule) {
 	s.prev = prev
 }
 
-var _ps, _qs Paths
-var _op pathOp
-var _fillRule FillRule
-
 func bentleyOttmann(ps, qs Paths, op pathOp, fillRule FillRule) Paths {
 	// TODO: add grid spacing argument
 	// TODO: add Intersects/Touches functions (return bool)
@@ -1799,8 +1795,6 @@ func bentleyOttmann(ps, qs Paths, op pathOp, fillRule FillRule) Paths {
 	//       right-endpoint for the squares it may now intersect? (Hershberger 2013)
 	// TODO: if overlapping segments can be detected earlier, we can just process left-events
 	//       and make the code simpler
-
-	_ps, _qs, _op, _fillRule = ps, qs, op, fillRule
 
 	// Implementation of the Bentley-Ottmann algorithm by reducing the complexity of finding
 	// intersections to O((n + k) log n), with n the number of segments and k the number of
@@ -2099,7 +2093,7 @@ func bentleyOttmann(ps, qs Paths, op pathOp, fillRule FillRule) Paths {
 
 		// Pass 2
 		// find all crossing segments, break them up and snap to the grid
-		squares.breakupCrossingSegments(n, x)
+		squares.breakupCrossingSegments(n, x, ps, qs, op, fillRule)
 
 		// snap events to grid
 		// note that this may make segments overlapping from the left and towards the right
