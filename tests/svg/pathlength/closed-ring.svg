@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120">
+  <!-- closed square ring, true perimeter 400 declared as pathLength 200:
+       the 10/10 normalized pattern becomes 20/20 user units and wraps the
+       closed path without NaN or phase drift -->
+  <polygon points="10,10 110,10 110,110 10,110" pathLength="200" fill="none" stroke="black" stroke-width="4" stroke-dasharray="10 10"/>
+</svg>

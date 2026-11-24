@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="240" height="120" viewBox="0 0 240 120">
+  <!-- reference textPath: geometry and startOffset both in user units -->
+  <path id="tp" d="M20 80 C 60 20, 180 20, 220 80" fill="none" stroke="#ccc"/>
+  <text font-family="serif" font-size="18" fill="black">
+    <textPath href="#tp" startOffset="20">Reference</textPath>
+  </text>
+</svg>

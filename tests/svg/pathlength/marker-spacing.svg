@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="60" viewBox="0 0 240 60">
+  <!-- markers distributed by user-space spacing; pathLength scales the
+       normalized spacing back to the true length, so a 25-unit spacing on a
+       path declared as length 100 places markers every 50 user units -->
+  <defs>
+    <marker id="dot" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto" spacing="userSpaceOnUse" markerSpacing="25">
+      <circle cx="3" cy="3" r="2.5" fill="red"/>
+    </marker>
+  </defs>
+  <line x1="10" y1="30" x2="210" y2="30" pathLength="100" stroke="black" stroke-width="2" marker-mid="url(#dot)"/>
+</svg>

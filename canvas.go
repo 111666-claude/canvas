@@ -713,6 +713,11 @@ type layer struct {
 
 	m     Matrix
 	style Style // only for path
+
+	// pathLengthScale maps SVG's normalized pathLength units back to the
+	// path's true user-space length (true length / declared pathLength);
+	// zero means no pathLength normalization applies.
+	pathLengthScale float64
 }
 
 // Canvas stores all drawing operations as layers that can be re-rendered to other renderers.

@@ -13,6 +13,7 @@ import (
 	"github.com/tdewolff/parse/v2/css"
 	"github.com/tdewolff/parse/v2/xml"
 
+	"github.com/tdewolff/font"
 	"golang.org/x/net/html"
 )
 
@@ -67,6 +68,16 @@ type svgParser struct {
 
 	// active definitions for attributes
 	activeDefs map[string]svgDef
+
+	// pathLength normalization factor of the shape currently being drawn,
+	// 1.0 when no valid pathLength attribute is present
+	pathLength float64
+
+	// paths registered by id, referenced by textPath through xlink:href/href
+	pathsByID map[string]*Path
+
+	// pathLength declared on the registered paths, 0.0 when absent
+	pathLengthByID map[string]float64
 }
 
 func (svg *svgParser) parseViewBox(attrWidth, attrHeight, attrViewBox string) (float64, float64, [4]float64) {
@@ -637,6 +648,16 @@ func (svg *svgParser) parseDefs(l *xml.Lexer) {
 				angle = svg.parseDimension(tag.attrs["orient"], 0.0)
 			}
 
+			// spacing is the distance between consecutive markers along the
+			// path (SVG 2 marker spacing). "auto" (the default) places
+			// marker-mid at every vertex, otherwise markers are distributed
+			// by arc length with markerSpacing as the user-space distance.
+			spacingAuto := tag.attrs["spacing"] != "userSpaceOnUse"
+			markerSpacing := 0.0
+			if !spacingAuto {
+				markerSpacing = svg.parseDimension(tag.attrs["markerSpacing"], svg.diagonal)
+			}
+
 			origSVGCanvas := svg.svgCanvas
 			svg.push(tag.name, tag.attrs)
 			svg.init(width, height, [4]float64{})
@@ -666,33 +687,67 @@ func (svg *svgParser) parseDefs(l *xml.Lexer) {
 				path := layer.path
 				strokeWidth := layer.style.StrokeWidth
 
-				a := angle
-				coordPos := path.Coords()
-				coordDir := path.CoordDirections()
-				for i := range coordPos {
-					if attr == "marker-start" && i == 0 || attr == "marker-end" && i == len(coordPos)-1 || attr == "marker-mid" && i != 0 && i != len(coordPos)-1 {
-						pos, dir := coordPos[i], coordDir[i]
-						if orient == "auto" || orient == "auto-start-reverse" {
-							a = dir.Angle()
-							if orient == "auto-start-reverse" {
-								a += 180.0
-							}
-						}
-
-						view := Identity.ReflectYAbout(c.H/2.0).Mul(svg.ctx.View()).Translate(pos.X, pos.Y).Rotate(a * 180.0 / math.Pi)
-						if units == "strokeWidth" {
-							view = view.Scale(strokeWidth, strokeWidth)
-						}
-
-						// Scale factor from viewBox to marker coordinates.
-						// When no viewBox, content uses marker coordinate space directly (no scaling).
-						f := 1.0
-						if viewbox[3] != 0 {
-							f = height / viewbox[3]
-						}
-						view = view.Translate(-refx*f, -refy*f).Scale(f, f).ReflectYAbout(height / 2.0)
-						marker.RenderViewTo(c, view)
+				// positions and tangent directions of the markers, either at
+				// the path vertices or evenly distributed by arc length. The
+				// pathLength normalization (if any) maps the spacing back to
+				// the true geometry length.
+				var positions []Point
+				var directions []Point
+				if spacingAuto {
+					positions = path.Coords()
+					directions = path.CoordDirections()
+				} else {
+					length := path.Length()
+					spacing := markerSpacing
+					if spacing <= 0.0 {
+						spacing = length
 					}
+					if 0.0 < layer.pathLengthScale {
+						spacing *= layer.pathLengthScale
+					}
+					distances := []float64{}
+					for d := spacing; d < length; d += spacing {
+						distances = append(distances, d)
+					}
+					positions, directions = path.PositionsAt(distances...)
+				}
+
+				a := angle
+				for i := range positions {
+					if spacingAuto {
+						if attr == "marker-start" && i == 0 || attr == "marker-end" && i == len(positions)-1 || attr == "marker-mid" && i != 0 && i != len(positions)-1 {
+							// vertex marker, position and direction computed below
+						} else {
+							continue
+						}
+					}
+					// with user-space spacing the interior arc-length
+					// positions are all drawn for marker-mid; marker-start and
+					// marker-end keep their endpoint semantics on vertex mode
+					if !spacingAuto && attr != "marker-mid" {
+						continue
+					}
+					pos, dir := positions[i], directions[i]
+					if orient == "auto" || orient == "auto-start-reverse" {
+						a = dir.Angle()
+						if orient == "auto-start-reverse" && (spacingAuto || i == 0) {
+							a += 180.0
+						}
+					}
+
+					view := Identity.ReflectYAbout(c.H/2.0).Mul(svg.ctx.View()).Translate(pos.X, pos.Y).Rotate(a * 180.0 / math.Pi)
+					if units == "strokeWidth" {
+						view = view.Scale(strokeWidth, strokeWidth)
+					}
+
+					// Scale factor from viewBox to marker coordinates.
+					// When no viewBox, content uses marker coordinate space directly (no scaling).
+					f := 1.0
+					if viewbox[3] != 0 {
+						f = height / viewbox[3]
+					}
+					view = view.Translate(-refx*f, -refy*f).Scale(f, f).ReflectYAbout(height / 2.0)
+					marker.RenderViewTo(c, view)
 				}
 			}
 		case "pattern":
@@ -1041,24 +1096,31 @@ func (svg *svgParser) getFontFace() *FontFace {
 }
 
 func (svg *svgParser) drawShape(tag string, attrs map[string]string) {
+	// pathLength is a geometry attribute, not a presentation (CSS) property,
+	// so it is read directly from the element attributes. It redefines the
+	// total path length used for distance computations (dashes, dash offset,
+	// textPath offsets, marker spacing). SVG mandates support on path, circle,
+	// ellipse, line, polygon, polyline and rect.
+	pathLengthAttr, hasPathLength := attrs["pathLength"]
+
 	switch tag {
 	case "circle":
 		cx := svg.parseDimension(attrs["cx"], svg.width)
 		cy := svg.parseDimension(attrs["cy"], svg.height)
 		r := svg.parseDimension(attrs["r"], svg.diagonal)
-		svg.ctx.DrawPath(cx, cy, Circle(r))
+		svg.drawPath(Circle(r), hasPathLength, pathLengthAttr, cx, cy)
 	case "ellipse":
 		cx := svg.parseDimension(attrs["cx"], svg.width)
 		cy := svg.parseDimension(attrs["cy"], svg.height)
 		rx := svg.parseDimension(attrs["rx"], svg.width)
 		ry := svg.parseDimension(attrs["ry"], svg.height)
-		svg.ctx.DrawPath(cx, cy, Ellipse(rx, ry))
+		svg.drawPath(Ellipse(rx, ry), hasPathLength, pathLengthAttr, cx, cy)
 	case "path":
 		p, err := ParseSVGPath(attrs["d"])
 		if err != nil && svg.err == nil {
 			svg.err = parse.NewErrorLexer(svg.z, "bad path: %w", err)
 		}
-		svg.ctx.DrawPath(0, 0, p)
+		svg.drawPath(p, hasPathLength, pathLengthAttr, 0, 0)
 	case "polygon", "polyline":
 		points := svg.parsePoints(attrs["points"])
 		p := &Path{}
@@ -1072,7 +1134,7 @@ func (svg *svgParser) drawShape(tag string, attrs map[string]string) {
 		if tag == "polygon" {
 			p.Close()
 		}
-		svg.ctx.DrawPath(0.0, 0.0, p)
+		svg.drawPath(p, hasPathLength, pathLengthAttr, 0.0, 0.0)
 	case "line":
 		p := &Path{}
 		x1 := svg.parseDimension(attrs["x1"], svg.width)
@@ -1082,14 +1144,15 @@ func (svg *svgParser) drawShape(tag string, attrs map[string]string) {
 
 		p.MoveTo(x1, y1)
 		p.LineTo(x2, y2)
-		svg.ctx.DrawPath(0.0, 0.0, p)
+		svg.drawPath(p, hasPathLength, pathLengthAttr, 0.0, 0.0)
 	case "rect":
 		x := svg.parseDimension(attrs["x"], svg.width)
 		y := svg.parseDimension(attrs["y"], svg.height)
 		width := svg.parseDimension(attrs["width"], svg.width)
 		height := svg.parseDimension(attrs["height"], svg.height)
+		var p *Path
 		if attrs["rx"] == "" && attrs["ry"] == "" {
-			svg.ctx.DrawPath(x, y, Rectangle(width, height))
+			p = Rectangle(width, height)
 		} else {
 			// TODO: handle both rx and ry
 			var r float64
@@ -1098,11 +1161,142 @@ func (svg *svgParser) drawShape(tag string, attrs map[string]string) {
 			} else {
 				r = svg.parseDimension(attrs["ry"], svg.height)
 			}
-			svg.ctx.DrawPath(x, y, RoundedRectangle(width, height, r))
+			p = RoundedRectangle(width, height, r)
 		}
+		svg.drawPath(p, hasPathLength, pathLengthAttr, x, y)
 	case "text":
 		svg.state.textX = svg.parseDimension(attrs["x"], svg.width)
 		svg.state.textY = svg.parseDimension(attrs["y"], svg.height)
+	}
+}
+
+// drawPath draws a shape path at (x,y) while applying the pathLength
+// normalization to the dash pattern. The stroke width and all other style
+// properties are left untouched, matching SVG semantics.
+func (svg *svgParser) drawPath(p *Path, hasPathLength bool, pathLengthAttr string, x, y float64) {
+	svg.pathLength = 1.0
+	pathLength := 0.0
+	if hasPathLength {
+		pathLength = svg.parseNumber(pathLengthAttr)
+		scale := p.NormalizeLength(pathLength)
+		if scale != 1.0 {
+			svg.pathLength = scale
+			if svg.ctx.Style.IsDashed() {
+				svg.ctx.Style.DashOffset, svg.ctx.Style.Dashes = p.NormalizeDashes(pathLength, svg.ctx.Style.DashOffset, svg.ctx.Style.Dashes)
+			}
+		}
+	}
+	svg.ctx.DrawPath(x, y, p)
+	layers := svg.c.layers[svg.c.zindex]
+	if hasPathLength && 0 < len(layers) {
+		// record the normalization factor on the rendered layer so that
+		// marker spacing (applied afterwards) can map normalized to true
+		// user-space distances
+		layers[len(layers)-1].pathLengthScale = svg.pathLength
+	}
+	if id := svg.elemStack[len(svg.elemStack)-1].id; id != "" {
+		svg.pathsByID[id] = p.Copy()
+		if hasPathLength {
+			svg.pathLengthByID[id] = pathLength
+		}
+	}
+}
+
+// drawTextPath renders the text of a textPath element along the referenced
+// path. startOffset gives the distance from the path's start where the text
+// begins, in user-space units; percentages resolve against the pathLength
+// declaration when present and against the true geometry length otherwise.
+// The pathLength normalization maps the declared length back to the true
+// length, so text stays aligned with any pathLength-scaled dash pattern.
+func (svg *svgParser) drawTextPath(attrs map[string]string, text string) {
+	id := svg.parseUrlID(attrs["href"])
+	if id == "" {
+		id = svg.parseUrlID(attrs["xlink:href"])
+	}
+	if id == "" {
+		// href may contain a bare fragment reference, e.g. href="#p"
+		for _, ref := range []string{attrs["href"], attrs["xlink:href"]} {
+			if strings.HasPrefix(ref, "#") && 1 < len(ref) {
+				id = ref[1:]
+				break
+			}
+		}
+	}
+	path, ok := svg.pathsByID[id]
+	if !ok {
+		return
+	}
+	path = path.Copy()
+	length := path.Length()
+	if length <= 0.0 {
+		return
+	}
+
+	// pathLength may be declared on the referenced path element itself
+	pathLength, hasPathLength := svg.pathLengthByID[id]
+	scale := 1.0
+	if hasPathLength {
+		scale = path.NormalizeLength(pathLength)
+	}
+
+	// startOffset: lengths in user units, percentages against pathLength
+	startOffset := 0.0
+	if v := attrs["startOffset"]; v != "" {
+		if strings.HasSuffix(v, "%") {
+			// a percentage resolves against the declared pathLength when
+			// present, otherwise against the true geometry length
+			base := length
+			if hasPathLength {
+				base = pathLength
+			}
+			startOffset = svg.parseNumber(v) * base * scale
+		} else {
+			startOffset = svg.parseDimension(v, svg.diagonal) * scale
+		}
+	}
+	if startOffset < 0.0 {
+		startOffset = 0.0
+	} else if length < startOffset {
+		startOffset = length
+	}
+
+	face := svg.getFontFace()
+	glyphPath, _ := face.ToPath(text)
+	if glyphPath.Empty() {
+		return
+	}
+
+	// place each glyph outline at its arc-length position on the path. The
+	// referenced path lives in user space and may be transformed by the
+	// context view, so glyphs are assembled in the path's local coordinate
+	// frame and drawn through the context at the path's start position.
+	// Glyph outlines are y-up while SVG's Cartesian IV frame is y-down, hence
+	// each glyph is reflected about its baseline.
+	origin := path.StartPos()
+	localPath := path.Copy().Translate(-origin.X, -origin.Y)
+	localLength := localPath.Length()
+	glyphs := face.Glyphs(text)
+	x := 0.0
+	out := &Path{}
+	mmPerEm := face.MmPerEm
+	for _, glyph := range glyphs {
+		g := &Path{}
+		if err := face.Font.GlyphPath(g, glyph.ID, face.PPEM(DefaultResolution), 0.0, 0.0, mmPerEm, font.NoHinting); err == nil && !g.Empty() {
+			d := startOffset + x
+			if d > localLength {
+				break
+			}
+			pos, dir := localPath.PositionAt(d)
+			a := dir.Angle() * 180.0 / math.Pi
+			// ReflectY flips the y-up glyph onto the y-down baseline,
+			// rotation and translation then place it on the path.
+			g = g.Transform(Identity.Translate(pos.X, pos.Y).Rotate(a).ReflectY())
+			out = out.Append(g)
+		}
+		x += mmPerEm * float64(glyph.XAdvance)
+	}
+	if !out.Empty() {
+		svg.ctx.DrawPath(origin.X, origin.Y, out)
 	}
 }
 
@@ -1112,10 +1306,12 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 
 	l := xml.NewLexer(z)
 	svg := svgParser{
-		z:          z,
-		defs:       map[string]svgDef{},
-		fonts:      map[string]*FontFamily{},
-		activeDefs: map[string]svgDef{},
+		z:              z,
+		defs:           map[string]svgDef{},
+		fonts:          map[string]*FontFamily{},
+		activeDefs:     map[string]svgDef{},
+		pathsByID:      map[string]*Path{},
+		pathLengthByID: map[string]float64{},
 	}
 	for {
 		tt, data := l.Next()
@@ -1196,14 +1392,24 @@ func ParseSVG(r io.Reader) (*Canvas, error) {
 		case xml.TextToken:
 			if 0 < len(svg.elemStack) {
 				tag := svg.elemStack[len(svg.elemStack)-1].tag
-				if tag == "text" {
+				t := html.UnescapeString(string(data))
+				if tag == "textPath" {
+					// find the enclosing textPath element's attributes
+					var attrs map[string]string
+					for i := len(svg.elemStack) - 1; i >= 0; i-- {
+						if svg.elemStack[i].tag == "textPath" {
+							attrs = svg.elemStack[i].attrs
+							break
+						}
+					}
+					svg.drawTextPath(attrs, t)
+				} else if tag == "text" {
 					textAlign := Left
 					if svg.state.textAnchor == "middle" {
 						textAlign = Center
 					} else if svg.state.textAnchor == "end" {
 						textAlign = Right
 					}
-					t := html.UnescapeString(string(data))
 					text := NewTextLine(svg.getFontFace(), t, textAlign)
 					svg.ctx.DrawText(svg.state.textX, svg.state.textY, text)
 				}

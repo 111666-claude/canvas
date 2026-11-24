@@ -1264,6 +1264,178 @@ func (p *Path) Length() float64 {
 	return d
 }
 
+// pathLengthScale returns the factor with which user-space distances along the
+// path need to be multiplied so that they match the author-provided pathLength
+// attribute. A return value of 1.0 means no normalization is applied (the
+// default). It never returns NaN: non-finite, non-positive, or overflowing
+// input falls back to the true geometry length. See SVG's pathLength attribute.
+func pathLengthScale(pathLength, length float64) float64 {
+	if math.IsNaN(pathLength) || math.IsInf(pathLength, 0) || pathLength <= 0.0 || math.IsNaN(length) || math.IsInf(length, 0) || length <= 0.0 {
+		return 1.0
+	}
+	scale := length / pathLength
+	if math.IsNaN(scale) || math.IsInf(scale, 0) || scale <= 0.0 || math.IsInf(1.0/scale, 0) {
+		return 1.0
+	}
+	return scale
+}
+
+// NormalizeLength returns the scale factor that maps user-space distances to
+// the normalized path length declared through SVG's pathLength attribute. A
+// pathLength that is zero, negative, non-finite, or that would overflow falls
+// back to the path's true length (a factor of 1.0), so the result is always a
+// positive finite number and can never produce NaN values. Lines, quadratic
+// and cubic Béziers, and elliptical arcs all contribute to the true length.
+func (p *Path) NormalizeLength(pathLength float64) float64 {
+	return pathLengthScale(pathLength, p.Length())
+}
+
+// NormalizeDashes scales the dash offset and dash array from the normalized
+// path length units declared by SVG's pathLength attribute to the true
+// user-space distances along the path. Stroke width is intentionally not
+// scaled, as SVG applies pathLength normalization only to distance-based
+// properties. Invalid pathLength values leave the dash pattern unchanged.
+func (p *Path) NormalizeDashes(pathLength, offset float64, dashes []float64) (float64, []float64) {
+	scale := p.NormalizeLength(pathLength)
+	if scale == 1.0 {
+		return offset, dashes
+	}
+	dashes2 := make([]float64, len(dashes))
+	for i, dash := range dashes {
+		dashes2[i] = dash * scale
+	}
+	return offset * scale, dashes2
+}
+
+// PositionAt returns the position and unit direction on the (sub)path at the
+// given arc-length distance d from its start. Distances beyond the path length
+// clamp to the path's end. Lines, Béziers and elliptical arcs are all
+// arc-length parameterized.
+func (p *Path) PositionAt(d float64) (Point, Point) {
+	if d < 0.0 {
+		d = 0.0
+	}
+	var start, end Point
+	var pos, dir Point
+	found := false
+	for i := 0; i < len(p.d); {
+		cmd := p.d[i]
+		switch cmd {
+		case MoveToCmd:
+			end = Point{p.d[i+1], p.d[i+2]}
+			pos, dir = end, Point{1.0, 0.0}
+			found = true
+		case LineToCmd, CloseCmd:
+			end = Point{p.d[i+1], p.d[i+2]}
+			seg := end.Sub(start)
+			segLen := seg.Length()
+			if d <= segLen || i+cmdLen(cmd) == len(p.d) {
+				t := 0.0
+				if 0.0 < segLen {
+					t = d / segLen
+					if t > 1.0 {
+						t = 1.0
+					}
+				}
+				pos = start.Interpolate(end, t)
+				if 0.0 < segLen {
+					dir = seg.Norm(1.0)
+				}
+				found = true
+				return pos, dir
+			}
+			d -= segLen
+		case QuadToCmd:
+			cp := Point{p.d[i+1], p.d[i+2]}
+			end = Point{p.d[i+3], p.d[i+4]}
+			speed := func(t float64) float64 {
+				return quadraticBezierDeriv(start, cp, end, t).Length()
+			}
+			invL, segLen := invSpeedPolynomialChebyshevApprox(20, gaussLegendre7, speed, 0.0, 1.0)
+			if d <= segLen || i+cmdLen(cmd) == len(p.d) {
+				t := invL(math.Min(math.Max(d, 0.0), segLen))
+				pos = quadraticBezierPos(start, cp, end, t)
+				dir = quadraticBezierDeriv(start, cp, end, t).Norm(1.0)
+				found = true
+				return pos, dir
+			}
+			d -= segLen
+		case CubeToCmd:
+			cp1 := Point{p.d[i+1], p.d[i+2]}
+			cp2 := Point{p.d[i+3], p.d[i+4]}
+			end = Point{p.d[i+5], p.d[i+6]}
+			speed := func(t float64) float64 {
+				return cubicBezierDeriv(start, cp1, cp2, end, t).Length()
+			}
+			N := 20 + 20*cubicBezierNumInflections(start, cp1, cp2, end)
+			invL, segLen := invSpeedPolynomialChebyshevApprox(N, gaussLegendre7, speed, 0.0, 1.0)
+			if d <= segLen || i+cmdLen(cmd) == len(p.d) {
+				t := invL(math.Min(math.Max(d, 0.0), segLen))
+				pos = cubicBezierPos(start, cp1, cp2, end, t)
+				dir = cubicBezierDeriv(start, cp1, cp2, end, t).Norm(1.0)
+				found = true
+				return pos, dir
+			}
+			d -= segLen
+		case ArcToCmd:
+			rx, ry, phi := p.d[i+1], p.d[i+2], p.d[i+3]
+			large, sweep := toArcFlags(p.d[i+4])
+			end = Point{p.d[i+5], p.d[i+6]}
+			cx, cy, theta1, theta2 := ellipseToCenter(start.X, start.Y, rx, ry, phi, large, sweep, end.X, end.Y)
+			// parameterize by the unsigned angle offset u in [0, |span|];
+			// a negative span (clockwise arc) traverses theta1 downward.
+			// Integrating from zero keeps the Chebyshev approximation's
+			// input domain well-defined regardless of theta1's value.
+			span := math.Abs(theta2 - theta1)
+			speed := func(u float64) float64 {
+				return ellipseDeriv(rx, ry, 0.0, true, theta1+u).Length()
+			}
+			invL, segLen := invSpeedPolynomialChebyshevApprox(10, gaussLegendre7, speed, 0.0, span)
+			if d <= segLen || i+cmdLen(cmd) == len(p.d) {
+				u := invL(math.Min(math.Max(d, 0.0), segLen))
+				theta := theta1 + u
+				if theta2 < theta1 {
+					theta = theta1 - u
+				}
+				pos = EllipsePos(rx, ry, phi, cx, cy, theta)
+				dir = ellipseDeriv(rx, ry, phi, sweep, theta).Norm(1.0)
+				found = true
+				return pos, dir
+			}
+			d -= segLen
+		}
+		i += cmdLen(cmd)
+		start = end
+	}
+	if !found {
+		return Point{}, Point{1.0, 0.0}
+	}
+	return pos, dir
+}
+
+// PositionsAt returns the positions and unit directions on the path at the
+// given arc-length distances from the path's start. Each subpath is measured
+// independently, so each distance is interpreted relative to its own
+// subpath start. Distances outside a subpath are clamped to its end.
+func (p *Path) PositionsAt(ds ...float64) ([]Point, []Point) {
+	positions := make([]Point, len(ds))
+	directions := make([]Point, len(ds))
+	subpaths := p.Split()
+	for k, d := range ds {
+		if d < 0.0 {
+			d = 0.0
+		}
+		if len(subpaths) == 0 {
+			positions[k], directions[k] = Point{}, Point{1.0, 0.0}
+			continue
+		}
+		// every distance is measured from the start of the first subpath,
+		// which is the common case for marker spacing on a single path
+		positions[k], directions[k] = subpaths[0].PositionAt(d)
+	}
+	return positions, directions
+}
+
 // Transform transforms the path by the given transformation matrix. It modifies the path in-place.
 func (p *Path) Transform(m Matrix) *Path {
 	_, _, _, xscale, yscale, _ := m.Decompose()
