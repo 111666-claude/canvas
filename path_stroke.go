@@ -1,6 +1,7 @@
 package canvas
 
 import (
+	"fmt"
 	"math"
 )
 
@@ -12,6 +13,51 @@ import (
 var FastStroke = false
 
 // NOTE: implementation inspired from github.com/golang/freetype/raster/stroke.go
+
+// StrokeAlignment defines how a stroke is aligned relative to the filled area of its path.
+type StrokeAlignment int
+
+// see StrokeAlignment
+const (
+	// StrokeAlignmentCenter centers the stroke on the path, extending half the stroke width to either side. This is the default.
+	StrokeAlignmentCenter StrokeAlignment = iota
+	// StrokeAlignmentInside places the stroke entirely inside the filled area of the path. The stroke is clipped to the fill region as defined by the fill rule, so the stroke never extends beyond the path's boundary. For open paths the fill region is enclosed by an implicit closing line; open paths without an enclosed area produce an empty stroke.
+	StrokeAlignmentInside
+	// StrokeAlignmentOutside places the stroke entirely outside the filled area of the path. The stroke is clipped to the complement of the fill region as defined by the fill rule, so the stroke never extends into the path's interior. For open paths the fill region is enclosed by an implicit closing line; open paths without an enclosed area produce the same stroke as center alignment.
+	StrokeAlignmentOutside
+)
+
+func (align StrokeAlignment) String() string {
+	switch align {
+	case StrokeAlignmentCenter:
+		return "Center"
+	case StrokeAlignmentInside:
+		return "Inside"
+	case StrokeAlignmentOutside:
+		return "Outside"
+	}
+	return fmt.Sprintf("StrokeAlignment(%d)", int(align))
+}
+
+// maxStrokeCoordinate bounds the absolute coordinates for aligned strokes. Beyond this, flattening
+// curves or snap-rounding in boolean operations may allocate an unbounded amount of memory or
+// overflow. This is far beyond any practical drawing coordinate (1e9mm is 1000km).
+const maxStrokeCoordinate = 1e9
+
+// strokePathValid returns true when p has finite coordinates within the supported range for
+// aligned stroking.
+func strokePathValid(p *Path) bool {
+	if p == nil || !p.Sane() {
+		return false
+	}
+	r := p.FastBounds()
+	for _, v := range [4]float64{r.X0, r.Y0, r.X1, r.Y1} {
+		if math.IsNaN(v) || math.IsInf(v, 0.0) || maxStrokeCoordinate < math.Abs(v) {
+			return false
+		}
+	}
+	return true
+}
 
 // Capper implements Cap, with rhs the path to append to, halfWidth the half width of the stroke, pivot the pivot point around which to construct a cap, and n0 the normal at the start of the path. The length of n0 is equal to the halfWidth.
 type Capper interface {
@@ -676,4 +722,170 @@ func (p *Path) Stroke(w float64, cr Capper, jr Joiner, tolerance float64) *Path 
 		q = q.Settle(Positive)
 	}
 	return q
+}
+
+// strokeSegmentEstimate estimates the number of segments produced when flattening p at the given
+// tolerance. Curve flattening spawns roughly sqrt(size/tolerance) segments. This is used to reject
+// aligned strokes that would otherwise allocate an unbounded amount of memory. The boolean
+// operations flatten at the global Tolerance, so the estimate takes the finer of the two to
+// overestimate rather than underestimate.
+func (p *Path) strokeSegmentEstimate(tolerance float64) float64 {
+	if p.Empty() {
+		return 0.0
+	}
+	tol := tolerance
+	if 0.0 < Tolerance && Tolerance < tol {
+		tol = Tolerance
+	}
+	if !(Epsilon < tol) || math.IsInf(tol, 0.0) || math.IsNaN(tol) {
+		return math.Inf(1)
+	}
+	bounds := p.FastBounds()
+	diag := math.Hypot(bounds.W(), bounds.H())
+	if math.IsInf(diag, 0.0) || math.IsNaN(diag) {
+		return math.Inf(1)
+	}
+	if diag == 0.0 {
+		return float64(p.Len())
+	}
+	est := 0.0
+	for i := 0; i < len(p.d); {
+		cmd := p.d[i]
+		if cmd == QuadToCmd || cmd == CubeToCmd || cmd == ArcToCmd {
+			est += math.Sqrt(diag / tol)
+		} else {
+			est += 1.0
+		}
+		i += cmdLen(cmd)
+	}
+	return est
+}
+
+// pathFilledArea returns the largest contour area of an already settled path. Settled paths are
+// grouped as a filling contour followed by its holes, but scanning all subpaths keeps this robust
+// for degenerate input. It is used to detect paths that do not enclose an area.
+func pathFilledArea(p *Path) float64 {
+	area := 0.0
+	for _, pi := range p.Split() {
+		if a := PolylineFromPathCoords(pi).Area(); area < a {
+			area = a
+		}
+	}
+	return area
+}
+
+// maxStrokeSegments is the maximum estimated number of segments for an aligned stroke. Beyond this
+// the aligned stroke is considered degenerate and an empty path is returned, to avoid allocating
+// an unbounded amount of memory for paths with very large coordinates or very small tolerances.
+const maxStrokeSegments = 1 << 20
+
+// StrokeAligned converts path p into a stroke of width w aligned to the fill region of p itself.
+// It is equivalent to p.StrokeAlignedTo(p, ...), see there for the alignment semantics.
+func (p *Path) StrokeAligned(w float64, cr Capper, jr Joiner, tolerance float64, align StrokeAlignment, fillRule FillRule) *Path {
+	return p.StrokeAlignedTo(p, w, cr, jr, tolerance, align, fillRule)
+}
+
+// StrokeAlignedTo converts path p into a stroke of width w aligned to the fill region of fillPath.
+// This is useful when p has been modified (e.g. dashed) while fillPath is the original path whose
+// fill region defines what is inside and outside.
+//
+// The fill region is the area that would be painted when filling fillPath with the given fill rule.
+// StrokeAlignmentInside keeps the full stroke width inside the fill region, StrokeAlignmentOutside
+// keeps the full stroke width outside the fill region, and StrokeAlignmentCenter does not clip at
+// all. The stroke boundary opposite to the path is moved by the full width, so a stroke of width w
+// always covers a band of width w, as for center alignment. Consequently:
+//   - holes and contours negated by the fill rule are outside of the fill region, so an inside
+//     stroke moves away from a hole (into the material) and an outside stroke moves into a hole;
+//   - self-intersecting paths are resolved using the fill rule;
+//   - open paths are implicitly closed to form their fill region, so an open path that does not
+//     enclose an area has an empty inside stroke and an outside stroke equal to the centered one;
+//   - the fill region is independent of the fill paint, its alpha, and the compositing order;
+//   - caps and joins apply to the stroke's outline; joins on the boundary side are honored.
+//
+// A non-positive or non-finite width, a non-positive or non-finite tolerance, an unknown alignment
+// (which degrades to center), or non-finite or excessively large coordinates (see
+// maxStrokeCoordinate) result in an empty path rather than an error or an unbounded allocation.
+// Extreme angles may cause the centered stroke itself to overflow, in which case an empty path is
+// returned as well.
+//
+// The alignment is resolved in the path's own coordinate space, before any renderer or view
+// transformation is applied, just like the stroke width itself. The stroke is flattened using the
+// boolean-operation tolerance, so aligned strokes are polygonal.
+func (p *Path) StrokeAlignedTo(fillPath *Path, w float64, cr Capper, jr Joiner, tolerance float64, align StrokeAlignment, fillRule FillRule) *Path {
+	if align != StrokeAlignmentInside && align != StrokeAlignmentOutside {
+		return p.Stroke(w, cr, jr, tolerance)
+	}
+	if math.IsInf(w, 0.0) || math.IsNaN(w) {
+		return &Path{}
+	}
+	w = math.Abs(w)
+	if !(Epsilon < w) {
+		// zero width has no stroke
+		return &Path{}
+	}
+	if !(Epsilon < tolerance) || math.IsInf(tolerance, 0.0) || math.IsNaN(tolerance) {
+		return &Path{}
+	}
+	if !strokePathValid(p) || !strokePathValid(fillPath) {
+		return &Path{}
+	}
+	if p.Empty() {
+		return &Path{}
+	}
+	if maxStrokeCoordinate < w || math.IsInf(2.0*w, 0.0) {
+		// a stroke wider than the coordinate bound would overflow
+		return &Path{}
+	}
+	if maxStrokeSegments < p.strokeSegmentEstimate(tolerance)+fillPath.strokeSegmentEstimate(tolerance) {
+		// too many segments would be generated, reject before allocating
+		return &Path{}
+	}
+
+	region := fillPath.Settle(fillRule)
+	if region.Empty() || !(Epsilon < pathFilledArea(region)) {
+		// no enclosed area, e.g. for open paths that do not enclose anything. Inside has nothing
+		// to fill, outside degrades to the centered stroke so that a line is not doubled in width.
+		if align == StrokeAlignmentInside {
+			return &Path{}
+		}
+		return p.Stroke(w, cr, jr, tolerance)
+	}
+
+	// Use a band of twice the width so that clipping it at the path halves it into a full-width
+	// stroke on either side. This is equivalent to offsetting the path by the full width and
+	// stroking it, but stays well-defined for self-intersections and narrow regions.
+	band := p.Stroke(2.0*w, cr, jr, tolerance)
+	if band.Empty() || !strokePathValid(band) {
+		// empty stroke, or an extreme join caused the centered stroke to overflow
+		return &Path{}
+	}
+
+	var q *Path
+	if align == StrokeAlignmentInside {
+		q = band.And(region)
+	} else {
+		q = band.Not(region)
+	}
+	if q == nil {
+		return &Path{}
+	}
+	return q
+}
+
+// StrokeStyle converts path p into its stroked outline according to the style's stroke width,
+// capper, joiner, dashes, and alignment. The caller is responsible for checking Style.HasStroke.
+// Dashes in Style.Dashes are multiples of the stroke width and are scaled accordingly. For aligned
+// strokes the dash pattern is applied in the path's own coordinate space and the fill region that
+// defines inside and outside is derived from the original (undashed) path, so that each dash is
+// aligned to the same boundary.
+func (p *Path) StrokeStyle(style Style, tolerance float64) *Path {
+	stroke := p
+	if 0 < len(style.Dashes) {
+		dashOffset, dashes := ScaleDash(style.StrokeWidth, style.DashOffset, style.Dashes)
+		stroke = stroke.Dash(dashOffset, dashes...)
+	}
+	if style.StrokeAlign == StrokeAlignmentInside || style.StrokeAlign == StrokeAlignmentOutside {
+		return stroke.StrokeAlignedTo(p, style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, tolerance, style.StrokeAlign, style.FillRule)
+	}
+	return stroke.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, tolerance)
 }

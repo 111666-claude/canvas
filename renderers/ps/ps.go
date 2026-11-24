@@ -170,7 +170,10 @@ func (r *PS) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix) 
 	// TODO: (EPS) use dither to fake transparency
 
 	strokeUnsupported := false
-	if _, ok := style.StrokeJoiner.(canvas.ArcsJoiner); ok {
+	if style.IsAligned() {
+		// aligned strokes are clipped to the fill region and must be drawn as an outline
+		strokeUnsupported = true
+	} else if _, ok := style.StrokeJoiner.(canvas.ArcsJoiner); ok {
 		strokeUnsupported = true
 	} else if miter, ok := style.StrokeJoiner.(canvas.MiterJoiner); ok {
 		if math.IsNaN(miter.Limit) {
@@ -218,10 +221,14 @@ func (r *PS) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix) 
 			r.w.Write([]byte(" stroke"))
 		} else {
 			// stroke settings unsupported by PDF, draw stroke explicitly
-			if style.IsDashed() {
-				path = path.Dash(style.DashOffset, style.Dashes...)
+			if style.IsAligned() {
+				path = path.StrokeStyle(style, canvas.Tolerance)
+			} else {
+				if style.IsDashed() {
+					path = path.Dash(style.DashOffset, style.Dashes...)
+				}
+				path = path.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance)
 			}
-			path = path.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance)
 
 			r.w.Write([]byte("\n"))
 			r.w.Write([]byte(path.Transform(m).ToPS()))

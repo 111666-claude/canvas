@@ -189,7 +189,10 @@ func (r *TeX) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix)
 	}
 
 	strokeUnsupported := false
-	if m.IsSimilarity() {
+	if style.IsAligned() {
+		// aligned strokes are clipped to the fill region and must be drawn as an outline
+		strokeUnsupported = true
+	} else if m.IsSimilarity() {
 		scale := math.Sqrt(math.Abs(m.Det()))
 		style.StrokeWidth *= scale
 		style.DashOffset, style.Dashes = canvas.ScaleDash(style.StrokeWidth, style.DashOffset, style.Dashes)
@@ -222,10 +225,14 @@ func (r *TeX) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix)
 
 	if style.HasStroke() && strokeUnsupported {
 		// stroke settings unsupported by TeX, draw stroke explicitly
-		if style.IsDashed() {
-			path = path.Dash(style.DashOffset, style.Dashes...)
+		if style.IsAligned() {
+			path = path.StrokeStyle(style, canvas.Tolerance)
+		} else {
+			if style.IsDashed() {
+				path = path.Dash(style.DashOffset, style.Dashes...)
+			}
+			path = path.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance)
 		}
-		path = path.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance)
 		r.writePath(path.Transform(m))
 		r.setFill(style.Stroke)
 		fmt.Fprintf(r.w, "\n\\pgfusepath{fill}")

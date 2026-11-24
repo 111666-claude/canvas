@@ -72,3 +72,23 @@ func TestCanvasFit(t *testing.T) {
 	test.Float(t, c.W, 20)
 	test.Float(t, c.H, 20)
 }
+
+func TestCanvasBoundsStrokeAlign(t *testing.T) {
+	// the canvas bounds expand by half the stroke width for centered strokes, not at all for
+	// inside strokes, and by the full width for outside strokes
+	square := MustParseSVGPath("M0 0H30V30H0z")
+	var bounds = [3]Rect{}
+	for i, align := range []StrokeAlignment{StrokeAlignmentCenter, StrokeAlignmentInside, StrokeAlignmentOutside} {
+		c := New(100, 100)
+		ctx := NewContext(c)
+		ctx.Style = DefaultStyle
+		ctx.Style.Stroke = Paint{Color: Black}
+		ctx.Style.StrokeWidth = 4.0
+		ctx.SetStrokeAlign(align)
+		ctx.DrawPath(10.0, 10.0, square)
+		bounds[i] = c.Bounds()
+	}
+	test.T(t, bounds[0], Rect{8.0, 8.0, 42.0, 42.0})
+	test.T(t, bounds[1], Rect{10.0, 10.0, 40.0, 40.0})
+	test.T(t, bounds[2], Rect{6.0, 6.0, 44.0, 44.0})
+}

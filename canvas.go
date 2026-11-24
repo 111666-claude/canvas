@@ -163,13 +163,14 @@ func ScaleDash(scale float64, offset float64, d []float64) (float64, []float64) 
 	return offset * scale, d2
 }
 
-// Style is the path style that defines how to draw the path. When Fill is not set it will not fill the path. If StrokeColor is transparent or StrokeWidth is zero, it will not stroke the path. If Dashes is an empty array, it will not draw dashes but instead a solid stroke line. FillRule determines how to fill the path when paths overlap and have certain directions (clockwise, counter clockwise).
+// Style is the path style that defines how to draw the path. When Fill is not set it will not fill the path. If StrokeColor is transparent or StrokeWidth is zero, it will not stroke the path. If Dashes is an empty array, it will not draw dashes but instead a solid stroke line. FillRule determines how to fill the path when paths overlap and have certain directions (clockwise, counter clockwise). StrokeAlign determines whether the stroke is centered on the path or placed entirely inside or outside the fill region; the default StrokeAlignmentCenter leaves rendering unchanged.
 type Style struct {
 	Fill         Paint
 	Stroke       Paint
 	StrokeWidth  float64
 	StrokeCapper Capper
 	StrokeJoiner Joiner
+	StrokeAlign  StrokeAlignment
 	DashOffset   float64
 	Dashes       []float64
 	FillRule     // TODO: test for all renderers
@@ -185,6 +186,11 @@ func (style Style) HasStroke() bool {
 	return style.Stroke.Has() && 0.0 < style.StrokeWidth
 }
 
+// IsAligned returns true when the stroke is aligned inside or outside the path's fill region, which requires renderers to convert the stroke to an outline rather than using a native stroking operator.
+func (style Style) IsAligned() bool {
+	return style.StrokeAlign == StrokeAlignmentInside || style.StrokeAlign == StrokeAlignmentOutside
+}
+
 // IsDashed returns true if the style has dashes
 func (style Style) IsDashed() bool {
 	return 0 < len(style.Dashes)
@@ -197,6 +203,7 @@ var DefaultStyle = Style{
 	StrokeWidth:  1.0,
 	StrokeCapper: ButtCap,
 	StrokeJoiner: MiterJoin,
+	StrokeAlign:  StrokeAlignmentCenter,
 	DashOffset:   0.0,
 	Dashes:       []float64{},
 	FillRule:     NonZero,
@@ -467,6 +474,11 @@ func (c *Context) SetStrokeCapper(capper Capper) {
 // SetStrokeJoiner sets the line join function to be used for stroke mid points. The default stroke joiner is a miter join with a limit of 4.0 for a bevel join.
 func (c *Context) SetStrokeJoiner(joiner Joiner) {
 	c.Style.StrokeJoiner = joiner
+}
+
+// SetStrokeAlign sets how the stroke is aligned to the path's fill region: centered on the path (the default), entirely inside the fill region, or entirely outside it. Aligned strokes are converted to outlines and therefore cannot be expressed as a native stroke in some renderers. Inside and outside strokes clip the stroke to the fill region as defined by the current fill rule; see Path.StrokeAlignedTo for the exact semantics.
+func (c *Context) SetStrokeAlign(align StrokeAlignment) {
+	c.Style.StrokeAlign = align
 }
 
 // SetDashes sets the dash pattern to be used for stroking operations. The dash offset denotes the offset into the dash array in millimeters from where to start. Negative values are allowed. The default dashes is empty at zero offset.
@@ -808,7 +820,15 @@ func (c *Canvas) Bounds() Rect {
 			if l.path != nil {
 				bounds = l.path.Bounds()
 				if l.style.HasStroke() {
+					// aligned outside strokes extend by the full width, inside strokes do not
+					// extend at all, and centered strokes extend by half the width
 					hw := l.style.StrokeWidth / 2.0
+					switch l.style.StrokeAlign {
+					case StrokeAlignmentInside:
+						hw = 0.0
+					case StrokeAlignmentOutside:
+						hw = l.style.StrokeWidth
+					}
 					bounds.X0 -= hw
 					bounds.Y0 -= hw
 					bounds.X1 += hw

@@ -182,7 +182,10 @@ func (r *SVG) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix)
 	fmt.Fprintf(r.w, `<path d="%s`, path.ToSVG())
 
 	strokeUnsupported := false
-	if arcs, ok := style.StrokeJoiner.(canvas.ArcsJoiner); ok && math.IsNaN(arcs.Limit) {
+	if style.IsAligned() {
+		// aligned strokes are clipped to the fill region and must be drawn as an outline
+		strokeUnsupported = true
+	} else if arcs, ok := style.StrokeJoiner.(canvas.ArcsJoiner); ok && math.IsNaN(arcs.Limit) {
 		strokeUnsupported = true
 	} else if miter, ok := style.StrokeJoiner.(canvas.MiterJoiner); ok {
 		if math.IsNaN(miter.Limit) {
@@ -273,10 +276,14 @@ func (r *SVG) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix)
 
 	if style.HasStroke() && strokeUnsupported {
 		// stroke settings unsupported by SVG, draw stroke explicitly
-		if style.IsDashed() {
-			stroke = stroke.Dash(style.DashOffset, style.Dashes...)
+		if style.IsAligned() {
+			stroke = stroke.StrokeStyle(style, canvas.Tolerance)
+		} else {
+			if style.IsDashed() {
+				stroke = stroke.Dash(style.DashOffset, style.Dashes...)
+			}
+			stroke = stroke.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance)
 		}
-		stroke = stroke.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance)
 		stroke = stroke.Transform(canvas.Identity.ReflectYAbout(r.height / 2.0).Mul(m))
 		fmt.Fprintf(r.w, `<path d="%s`, stroke.ToSVG())
 		if !style.Stroke.IsColor() || style.Stroke.Color != canvas.Black {

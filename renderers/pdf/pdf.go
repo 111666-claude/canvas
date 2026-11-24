@@ -104,7 +104,10 @@ func (r *PDF) Size() (float64, float64) {
 func (r *PDF) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix) {
 	// PDFs don't support the arcs joiner, miter joiner (not clipped), or miter joiner (clipped) with non-bevel fallback
 	strokeUnsupported := false
-	if _, ok := style.StrokeJoiner.(canvas.ArcsJoiner); ok {
+	if style.IsAligned() {
+		// aligned strokes are clipped to the fill region and must be drawn as an outline
+		strokeUnsupported = true
+	} else if _, ok := style.StrokeJoiner.(canvas.ArcsJoiner); ok {
 		strokeUnsupported = true
 	} else if miter, ok := style.StrokeJoiner.(canvas.MiterJoiner); ok {
 		if math.IsNaN(miter.Limit) {
@@ -213,10 +216,14 @@ func (r *PDF) RenderPath(path *canvas.Path, style canvas.Style, m canvas.Matrix)
 		}
 
 		// stroke settings unsupported by PDF, draw stroke explicitly
-		if style.IsDashed() {
-			path = path.Dash(style.DashOffset, style.Dashes...)
+		if style.IsAligned() {
+			path = path.StrokeStyle(style, canvas.Tolerance)
+		} else {
+			if style.IsDashed() {
+				path = path.Dash(style.DashOffset, style.Dashes...)
+			}
+			path = path.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance)
 		}
-		path = path.Stroke(style.StrokeWidth, style.StrokeCapper, style.StrokeJoiner, canvas.Tolerance)
 
 		r.w.SetFill(style.Stroke, m)
 		r.w.Write([]byte(" "))
