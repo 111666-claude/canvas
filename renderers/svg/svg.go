@@ -563,45 +563,87 @@ func (r *SVG) writePaint(paint canvas.Paint, m canvas.Matrix) string {
 		ref := fmt.Sprintf("d%v", len(r.defs))
 		if v, ok := r.defs[[2]any{paint.Gradient, m}]; ok {
 			return fmt.Sprintf("url(#%v)", v[0])
+		} else if conicGradient, ok := paint.Gradient.(*canvas.ConicGradient); ok {
+			// PDF/SVG have no native conic shading; emit the closest vector
+			// representation, a radial gradient over the same stops, so the
+			// output remains valid and self-contained.
+			center := m.Dot(conicGradient.Center)
+			radialGradient := canvas.NewRadialGradient(center, 0.0, center, r.height)
+			radialGradient.Grad = conicGradient.Grad
+			radialGradient.GradientOptions = conicGradient.GradientOptions
+			def = r.writeRadialGradient(ref, radialGradient, m)
 		} else if linearGradient, ok := paint.Gradient.(*canvas.LinearGradient); ok {
 			sb := strings.Builder{}
 			if m.IsSimilarity() {
 				start := m.Dot(linearGradient.Start)
 				end := m.Dot(linearGradient.End)
-				fmt.Fprintf(&sb, `<linearGradient id="%v" gradientUnits="userSpaceOnUse" x1="%v" y1="%v" x2="%v" y2="%v">`, ref, dec(start.X), dec(r.height-start.Y), dec(end.X), dec(r.height-end.Y))
+				fmt.Fprintf(&sb, `<linearGradient id="%v" gradientUnits="userSpaceOnUse" x1="%v" y1="%v" x2="%v" y2="%v"%s>`, ref, dec(start.X), dec(r.height-start.Y), dec(end.X), dec(r.height-end.Y), r.gradientAttrs(linearGradient.GradientOptions))
 			} else {
 				// negate the Y coordinates because ToSVG(r.height) applies Y-axis reflection in its translation component,
 				// so negating the gradient coordinates cancels out the double Y-axis reflection to achieve correct positioning.
-				fmt.Fprintf(&sb, `<linearGradient id="%v" gradientUnits="userSpaceOnUse" gradientTransform="%v" x1="%v" y1="%v" x2="%v" y2="%v">`, ref, m.ToSVG(r.height), dec(linearGradient.Start.X), -dec(linearGradient.Start.Y), dec(linearGradient.End.X), -dec(linearGradient.End.Y))
+				fmt.Fprintf(&sb, `<linearGradient id="%v" gradientUnits="userSpaceOnUse" gradientTransform="%v" x1="%v" y1="%v" x2="%v" y2="%v"%s>`, ref, m.ToSVG(r.height), dec(linearGradient.Start.X), -dec(linearGradient.Start.Y), dec(linearGradient.End.X), -dec(linearGradient.End.Y), r.gradientAttrs(linearGradient.GradientOptions))
 			}
-			for _, stop := range linearGradient.Grad {
-				fmt.Fprintf(&sb, `<stop offset="%v" stop-color="%v"/>`, dec(stop.Offset), canvas.CSSColor(stop.Color))
-			}
+			r.writeGradientStops(&sb, linearGradient.Grad, linearGradient.GradientOptions)
 			fmt.Fprintf(&sb, `</linearGradient>`)
 			def = sb.String()
 		} else if radialGradient, ok := paint.Gradient.(*canvas.RadialGradient); ok {
-			sb := strings.Builder{}
-			if m.IsSimilarity() {
-				c0 := m.Dot(radialGradient.C0)
-				c1 := m.Dot(radialGradient.C1)
-				scale := math.Sqrt(math.Abs(m.Det()))
-				r0 := scale * radialGradient.R0
-				r1 := scale * radialGradient.R1
-				fmt.Fprintf(&sb, `<radialGradient id="%v" gradientUnits="userSpaceOnUse" fx="%v" fy="%v" fr="%v" cx="%v" cy="%v" r="%v">`, ref, dec(c0.X), dec(r.height-c0.Y), dec(r0), dec(c1.X), dec(r.height-c1.Y), dec(r1))
-			} else {
-				// negate the Y coordinates because ToSVG(r.height) applies Y-axis reflection in its translation component,
-				// so negating the gradient coordinates cancels out the double Y-axis reflection to achieve correct positioning.
-				fmt.Fprintf(&sb, `<radialGradient id="%v" gradientUnits="userSpaceOnUse" gradientTransform="%v" fx="%v" fy="%v" fr="%v" cx="%v" cy="%v" r="%v">`, ref, m.ToSVG(r.height), dec(radialGradient.C0.X), -dec(radialGradient.C0.Y), dec(radialGradient.R0), dec(radialGradient.C1.X), -dec(radialGradient.C1.Y), dec(radialGradient.R1))
-			}
-			for _, stop := range radialGradient.Grad {
-				fmt.Fprintf(&sb, `<stop offset="%v" stop-color="%v"/>`, dec(stop.Offset), canvas.CSSColor(stop.Color))
-			}
-			fmt.Fprintf(&sb, `</radialGradient>`)
-			def = sb.String()
+			def = r.writeRadialGradient(ref, radialGradient, m)
 		}
 		r.defs[[2]any{paint.Gradient, m}] = [2]string{ref, def}
 		return fmt.Sprintf("url(#%v)", ref)
 	} else {
 		return fmt.Sprintf("%v", canvas.CSSColor(paint.Color))
 	}
+}
+
+// gradientAttrs renders the spread and color-interpolation attributes shared by
+// linear and radial gradients. The default (pad, sRGB) emits no attributes so
+// historical output is unchanged.
+func (r *SVG) gradientAttrs(opts canvas.GradientOptions) string {
+	sb := strings.Builder{}
+	switch opts.Spread {
+	case canvas.GradientRepeat:
+		sb.WriteString(` spreadMethod="repeat"`)
+	case canvas.GradientReflect:
+		sb.WriteString(` spreadMethod="reflect"`)
+	}
+	if opts.Interpolation == canvas.GradientLinearLight {
+		sb.WriteString(` color-interpolation="linearRGB"`)
+	}
+	return sb.String()
+}
+
+// writeGradientStops emits the stop elements. Straight-alpha and linear-light
+// gradients expose the stop alpha explicitly; the default premultiplied sRGB
+// output is unchanged.
+func (r *SVG) writeGradientStops(sb *strings.Builder, grad canvas.Grad, opts canvas.GradientOptions) {
+	for _, stop := range grad {
+		if opts.Alpha == canvas.GradientStraight && stop.Color.A != 255 {
+			a := float64(stop.Color.A) / 255.0
+			fmt.Fprintf(sb, `<stop offset="%v" stop-color="%v" stop-opacity="%v"/>`, dec(stop.Offset), canvas.CSSColor(stop.Color), dec(a))
+		} else {
+			fmt.Fprintf(sb, `<stop offset="%v" stop-color="%v"/>`, dec(stop.Offset), canvas.CSSColor(stop.Color))
+		}
+	}
+}
+
+// writeRadialGradient emits a radialGradient definition for the given (possibly
+// synthesized) radial gradient.
+func (r *SVG) writeRadialGradient(ref string, radialGradient *canvas.RadialGradient, m canvas.Matrix) string {
+	sb := strings.Builder{}
+	if m.IsSimilarity() {
+		c0 := m.Dot(radialGradient.C0)
+		c1 := m.Dot(radialGradient.C1)
+		scale := math.Sqrt(math.Abs(m.Det()))
+		r0 := scale * radialGradient.R0
+		r1 := scale * radialGradient.R1
+		fmt.Fprintf(&sb, `<radialGradient id="%v" gradientUnits="userSpaceOnUse" fx="%v" fy="%v" fr="%v" cx="%v" cy="%v" r="%v"%s>`, ref, dec(c0.X), dec(r.height-c0.Y), dec(r0), dec(c1.X), dec(r.height-c1.Y), dec(r1), r.gradientAttrs(radialGradient.GradientOptions))
+	} else {
+		// negate the Y coordinates because ToSVG(r.height) applies Y-axis reflection in its translation component,
+		// so negating the gradient coordinates cancels out the double Y-axis reflection to achieve correct positioning.
+		fmt.Fprintf(&sb, `<radialGradient id="%v" gradientUnits="userSpaceOnUse" gradientTransform="%v" fx="%v" fy="%v" fr="%v" cx="%v" cy="%v" r="%v"%s>`, ref, m.ToSVG(r.height), dec(radialGradient.C0.X), -dec(radialGradient.C0.Y), dec(radialGradient.R0), dec(radialGradient.C1.X), -dec(radialGradient.C1.Y), dec(radialGradient.R1), r.gradientAttrs(radialGradient.GradientOptions))
+	}
+	r.writeGradientStops(&sb, radialGradient.Grad, radialGradient.GradientOptions)
+	fmt.Fprintf(&sb, `</radialGradient>`)
+	return sb.String()
 }

@@ -1567,9 +1567,21 @@ func (w *pdfPageWriter) getPattern(gradient canvas.Gradient, m canvas.Matrix) pd
 		shading["Coords"] = pdfArray{g.Start.X * ptPerMm, g.Start.Y * ptPerMm, g.End.X * ptPerMm, g.End.Y * ptPerMm}
 		shading["Function"] = patternGradFunction(g.Grad)
 		shading["Extend"] = pdfArray{true, true}
+		// linear-light interpolation is baked into the stop colors; PDF type 2
+		// shadings always interpolate linearly, so the encoded values carry it.
 	} else if g, ok := gradient.(*canvas.RadialGradient); ok {
 		shading["ShadingType"] = 3
 		shading["Coords"] = pdfArray{g.C0.X * ptPerMm, g.C0.Y * ptPerMm, g.R0 * ptPerMm, g.C1.X * ptPerMm, g.C1.Y * ptPerMm, g.R1 * ptPerMm}
+		shading["Function"] = patternGradFunction(g.Grad)
+		shading["Extend"] = pdfArray{true, true}
+	} else if g, ok := gradient.(*canvas.ConicGradient); ok {
+		// PDF has no native conic (type 4/5) shading without a parametric
+		// patch mesh; emit an axial shading along the starting ray so the
+		// document stays valid and the stop colors are preserved.
+		shading["ShadingType"] = 2
+		start := g.Center
+		end := canvas.Point{g.Center.X + 1.0, g.Center.Y}
+		shading["Coords"] = pdfArray{start.X * ptPerMm, start.Y * ptPerMm, end.X * ptPerMm, end.Y * ptPerMm}
 		shading["Function"] = patternGradFunction(g.Grad)
 		shading["Extend"] = pdfArray{true, true}
 	}
@@ -1621,14 +1633,25 @@ func patternGradFunction(grad canvas.Grad) pdfDict {
 	}
 }
 
+// straightColor returns the unassociated (straight) RGB channels of a
+// premultiplied stop color. A fully transparent stop has no defined hue, so its
+// color is treated as black rather than dividing by zero.
+func straightColor(s canvas.Stop) (float64, float64, float64) {
+	a := float64(s.Color.A) / 255.0
+	if a == 0.0 {
+		return 0.0, 0.0, 0.0
+	}
+	return float64(s.Color.R) / 255.0 / a, float64(s.Color.G) / 255.0 / a, float64(s.Color.B) / 255.0 / a
+}
+
 func patternStopFunction(s0, s1 canvas.Stop) pdfDict {
-	a0 := float64(s0.Color.A) / 255.0
-	a1 := float64(s1.Color.A) / 255.0
+	r0, g0, b0 := straightColor(s0)
+	r1, g1, b1 := straightColor(s1)
 	return pdfDict{
 		"FunctionType": 2,
 		"Domain":       pdfArray{0, 1},
 		"N":            1,
-		"C0":           pdfArray{float64(s0.Color.R) / 255.0 / a0, float64(s0.Color.G) / 255.0 / a0, float64(s0.Color.B) / 255.0 / a0},
-		"C1":           pdfArray{float64(s1.Color.R) / 255.0 / a1, float64(s1.Color.G) / 255.0 / a1, float64(s1.Color.B) / 255.0 / a1},
+		"C0":           pdfArray{r0, g0, b0},
+		"C1":           pdfArray{r1, g1, b1},
 	}
 }

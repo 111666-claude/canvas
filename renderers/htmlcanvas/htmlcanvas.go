@@ -72,13 +72,22 @@ func (r *HTMLCanvas) toStyle(paint canvas.Paint) any {
 	} else if paint.IsGradient() {
 		if g, ok := paint.Gradient.(*canvas.LinearGradient); ok {
 			grad := r.ctx.Call("createLinearGradient", g.Start.X*r.dpm, r.height-g.Start.Y*r.dpm, g.End.X*r.dpm, r.height-g.End.Y*r.dpm)
-			for _, stop := range g.Stops {
+			for _, stop := range g.Grad {
 				grad.Call("addColorStop", stop.Offset, canvas.CSSColor(stop.Color).String())
 			}
 			return grad
 		} else if g, ok := paint.Gradient.(*canvas.RadialGradient); ok {
 			grad := r.ctx.Call("createRadialGradient", g.C0.X*r.dpm, r.height-g.C0.Y*r.dpm, g.R0*r.dpm, g.C1.X*r.dpm, r.height-g.C1.Y*r.dpm, g.R1*r.dpm)
-			for _, stop := range g.Stops {
+			for _, stop := range g.Grad {
+				grad.Call("addColorStop", stop.Offset, canvas.CSSColor(stop.Color).String())
+			}
+			return grad
+		} else if g, ok := paint.Gradient.(*canvas.ConicGradient); ok {
+			// HTML canvas supports createConicGradient; angle is clockwise from
+			// the positive X axis in screen space, so negate for canvas's
+			// upward-pointing Y and offset by the configured start angle.
+			grad := r.ctx.Call("createConicGradient", -g.Angle, g.Center.X*r.dpm, r.height-g.Center.Y*r.dpm)
+			for _, stop := range g.Grad {
 				grad.Call("addColorStop", stop.Offset, canvas.CSSColor(stop.Color).String())
 			}
 			return grad

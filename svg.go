@@ -447,6 +447,18 @@ func (svg *svgParser) parseTag(l *xml.Lexer) *svgTag {
 	return root
 }
 
+// parseGradientSpread maps an SVG spreadMethod attribute to a GradientSpread.
+// Unknown or empty values default to pad, matching the SVG specification.
+func parseGradientSpread(v string) GradientSpread {
+	switch v {
+	case "repeat":
+		return GradientRepeat
+	case "reflect":
+		return GradientReflect
+	}
+	return GradientPad
+}
+
 func (svg *svgParser) parseDefs(l *xml.Lexer) {
 	for {
 		tag := svg.parseTag(l)
@@ -508,6 +520,7 @@ func (svg *svgParser) parseDefs(l *xml.Lexer) {
 				}
 
 				linearGradient := grad.ToLinear(Point{x1t, y1t}, Point{x2t, y2t})
+				linearGradient.Spread = parseGradientSpread(tag.attrs["spreadMethod"])
 				if attr == "fill" {
 					layer.style.Fill = Paint{Gradient: linearGradient}
 				} else if attr == "stroke" {
@@ -589,6 +602,7 @@ func (svg *svgParser) parseDefs(l *xml.Lexer) {
 				}
 
 				radialGradient := grad.ToRadial(Point{fxt, fyt}, frt, Point{cxt, cyt}, rt)
+				radialGradient.Spread = parseGradientSpread(tag.attrs["spreadMethod"])
 				if attr == "fill" {
 					layer.style.Fill = Paint{Gradient: radialGradient}
 				} else if attr == "stroke" {
